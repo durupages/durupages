@@ -70,23 +70,38 @@ jobs:
       - name: Free disk space
         # A full workerd + V8 build needs far more than the ~14 GB free on a
         # stock runner; reclaim the large preinstalled toolchains we do not use.
+        # Removing the Android SDK also leaves ANDROID_HOME dangling — build.sh
+        # blanks it for Bazel (rules_android would otherwise fail analysis), and
+        # we clear it for the whole job here so nothing else trips over it.
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
                       /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
                       "$AGENT_TOOLSDIRECTORY" || true
+          echo "ANDROID_HOME=" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=" >> "$GITHUB_ENV"
           df -h /
 
       - name: Install build toolchain
         run: |
           set -euo pipefail
           sudo apt-get update
-          # clang/clang++ (C++23), lld (ld.lld) and tclsh (sqlite codegen).
-          sudo apt-get install -y --no-install-recommends clang lld tcl git ca-certificates
+          # LLVM 20 explicitly (all from the Ubuntu 24.04 archive):
+          #  - workerd compiles with -stdlib=libc++, so the libc++ *dev* headers
+          #    are required or every TU fails with "'cstddef' file not found".
+          #  - We install the VERSIONED packages only and deliberately not the
+          #    unversioned `clang`/`lld`. build.sh prefers an unversioned clang
+          #    if one exists, and Ubuntu's plain `clang` is 18 without matching
+          #    libc++ — leaving it out makes build.sh pick clang-20, which is the
+          #    combination this build is verified against.
+          #  - tcl provides tclsh, needed by sqlite's build codegen.
+          sudo apt-get install -y --no-install-recommends \
+            clang-20 lld-20 libc++-20-dev libc++abi-20-dev \
+            tcl git ca-certificates
           # bazelisk honours the repo's .bazelversion and fetches the right bazel.
           sudo curl -fsSL -o /usr/local/bin/bazelisk \
             https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64
           sudo chmod +x /usr/local/bin/bazelisk
-          clang --version | head -1
+          clang-20 --version | head -1
           bazelisk version || true
 
       - name: Restore bazel disk cache
@@ -102,6 +117,10 @@ jobs:
       - name: Build durupages-workerd
         env:
           DURUPAGES_BAZEL: bazelisk
+          # Pin the compiler: runner images ship an unversioned `clang` (18)
+          # that build.sh would otherwise prefer, and it has no matching libc++.
+          DURUPAGES_CC: clang-20
+          DURUPAGES_CXX: clang++-20
           # ubuntu-latest has 4 cores / 16 GB RAM; keep memory pressure sane.
           DURUPAGES_BUILD_JOBS: '4'
           DURUPAGES_BUILD_MEM_MB: '12000'

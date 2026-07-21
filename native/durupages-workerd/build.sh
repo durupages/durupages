@@ -31,6 +31,12 @@ log() { printf '\n\033[1;34m==> %s\033[0m\n' "$*"; }
 
 # ---------------------------------------------------------------------------
 # Toolchain: provide unversioned clang/clang++/ld.lld/tclsh on PATH.
+#
+# DURUPAGES_CC / DURUPAGES_CXX pin an exact compiler. Use them when a machine
+# already has an unversioned `clang` you do not want (CI runners ship one), or
+# when the C++ compiler must match the installed libc++: workerd builds with
+# -stdlib=libc++, so a clang whose libc++ dev headers are absent fails every
+# translation unit with "'cstddef' file not found".
 # ---------------------------------------------------------------------------
 TOOLBIN="${WORK}/toolbin"
 mkdir -p "${TOOLBIN}"
@@ -45,13 +51,32 @@ link_tool() { # link_tool <unversioned> <candidate...>
   done
   echo "ERROR: none of [${*}] found for required tool '${want}'" >&2; exit 1
 }
-link_tool clang    clang-20 clang-19 clang-18 clang
-link_tool clang++  clang++-20 clang++-19 clang++-18 clang++
+pin_tool() { # pin_tool <unversioned> <requested>
+  local want="$1" req="$2" path
+  path="$(command -v "${req}" 2>/dev/null || true)"
+  if [[ -z "${path}" ]]; then
+    echo "ERROR: requested tool '${req}' not found" >&2; exit 1
+  fi
+  ln -sf "${path}" "${TOOLBIN}/${want}"
+}
+
+if [[ -n "${DURUPAGES_CC:-}" ]]; then
+  pin_tool clang "${DURUPAGES_CC}"
+else
+  link_tool clang clang-20 clang-19 clang-18 clang
+fi
+if [[ -n "${DURUPAGES_CXX:-}" ]]; then
+  pin_tool clang++ "${DURUPAGES_CXX}"
+else
+  link_tool clang++ clang++-20 clang++-19 clang++-18 clang++
+fi
 link_tool ld.lld   lld-20 lld-19 lld-18 ld.lld
 link_tool tclsh    tclsh8.6 tclsh8.7 tclsh
 export PATH="${TOOLBIN}:${PATH}"
 CC_BIN="$(command -v clang)"
 CXX_BIN="$(command -v clang++)"
+log "Using CC=${CC_BIN} CXX=${CXX_BIN}"
+"${CC_BIN}" --version | head -1
 
 BAZEL="${DURUPAGES_BAZEL:-bazelisk}"
 command -v "${BAZEL}" >/dev/null 2>&1 || BAZEL=bazel
@@ -80,6 +105,13 @@ done
 log "Building //src/workerd/server:workerd"
 JOBS="${DURUPAGES_BUILD_JOBS:-$(( $(nproc) > 8 ? 6 : $(nproc) ))}"
 MEM="${DURUPAGES_BUILD_MEM_MB:-7000}"
+
+# workerd pulls in rules_android transitively. Its repository rule reads
+# ANDROID_HOME and, when that points at an SDK with no installed API levels,
+# fails analysis outright with "No Android SDK apis found". We build no Android
+# targets, so blank the variables out: an unset value makes the rule emit an
+# empty stub repo instead. GitHub runners set ANDROID_HOME, so without this the
+# build breaks there even though it succeeds on a machine that has none.
 ( cd "${SRC}" && CC="${CC_BIN}" CXX="${CXX_BIN}" "${BAZEL}" build //src/workerd/server:workerd \
     --jobs="${JOBS}" \
     --local_resources=memory="${MEM}" \
@@ -87,6 +119,8 @@ MEM="${DURUPAGES_BUILD_MEM_MB:-7000}"
     --repo_env=CC="${CC_BIN}" \
     --repo_env=CXX="${CXX_BIN}" \
     --repo_env=BAZEL_COMPILER=clang \
+    --repo_env=ANDROID_HOME= \
+    --repo_env=ANDROID_SDK_ROOT= \
     --action_env=PATH="${TOOLBIN}:/bin:/usr/bin:/usr/local/bin" \
     --host_action_env=PATH="${TOOLBIN}:/bin:/usr/bin:/usr/local/bin" \
     --linkopt=-fuse-ld=lld )
