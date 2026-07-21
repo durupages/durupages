@@ -131,7 +131,7 @@ jobs:
 
       - name: Build & push worker-native image
         if: ${{ inputs.push_image }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
