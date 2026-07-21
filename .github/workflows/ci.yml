@@ -44,6 +44,27 @@ jobs:
       - name: go test (race)
         run: go test -race ./...
 
+  # Full integration stack (k3s + PostgreSQL + MinIO + controller/router/hub/
+  # worker) via docker-compose. The worker image uses the official workerd
+  # release pinned in native/durupages-workerd/WORKERD_VERSION, not "latest",
+  # so the run is reproducible (see scripts/e2e-up.sh).
+  e2e:
+    name: e2e (k3s + postgres + minio)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      COMPOSE: docker compose
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: make e2e
+        run: make e2e
+
   lint:
     name: lint (gofmt + vet)
     runs-on: ubuntu-latest

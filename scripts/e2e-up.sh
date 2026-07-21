@@ -28,13 +28,21 @@ fi
 chmod 0644 "${KEYS_DIR}"/*.pem
 
 # ---------------------------------------------------------------------------
-# 2. Build component images from the multi-target root Dockerfile.
+# 2. Build component images from the multi-target root Dockerfile. The worker
+#    image is pinned to the official workerd release tracked for the native
+#    build (native/durupages-workerd/WORKERD_VERSION), not "latest", so e2e
+#    runs against a known-good, reproducible workerd binary.
 # ---------------------------------------------------------------------------
-log "Building component images (controller/hub/router/worker)"
+# shellcheck source=../native/durupages-workerd/WORKERD_VERSION
+source "${REPO_ROOT}/native/durupages-workerd/WORKERD_VERSION"
+
+log "Building component images (controller/hub/router/worker, workerd ${WORKERD_UPSTREAM_VERSION})"
 docker build --target controller -t durupages/controller:e2e .
 docker build --target hub        -t durupages/hub:e2e .
 docker build --target router     -t durupages/router:e2e .
-docker build --target worker     -t "${WORKER_IMAGE}" .
+docker build --target worker \
+  --build-arg WORKERD_NPM_VERSION="${WORKERD_UPSTREAM_VERSION}" \
+  -t "${WORKER_IMAGE}" .
 # Router e2e wrapper (adds iproute2 + pod-network route). Built with `docker
 # build` on purpose: it FROMs the local durupages/router:e2e image, which the
 # compose builder would try (and fail) to pull from a registry.

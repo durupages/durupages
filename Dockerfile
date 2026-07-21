@@ -19,12 +19,19 @@ RUN --mount=type=cache,target=/go/pkg/mod --mount=type=cache,target=/root/.cache
 # Fetch a workerd binary for the worker image. Until native/durupages-workerd
 # is built, the official binary is used as a dev fallback (cpuTime metering
 # and isolate limits are inactive with it — see native/durupages-workerd/README.md).
+# WORKERD_NPM_VERSION pins the exact @cloudflare/workerd-linux-64 release
+# (e.g. 1.20260721.1, matching native/durupages-workerd/WORKERD_VERSION's
+# WORKERD_UPSTREAM_VERSION); "latest" resolves the newest published release.
 FROM debian:bookworm-slim AS workerd-fetch
 ARG WORKERD_NPM_VERSION=latest
 RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
-RUN curl -fsSL "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/$( \
-      curl -fsSL https://registry.npmjs.org/@cloudflare/workerd-linux-64 \
-      | sed -n 's/.*"latest":"\([^"]*\)".*/workerd-linux-64-\1.tgz/p')" -o /tmp/workerd.tgz \
+RUN set -eu; \
+    version="$WORKERD_NPM_VERSION"; \
+    if [ "$version" = "latest" ]; then \
+      version="$(curl -fsSL https://registry.npmjs.org/@cloudflare/workerd-linux-64 \
+        | sed -n 's/.*"latest":"\([^"]*\)".*/\1/p')"; \
+    fi; \
+    curl -fsSL "https://registry.npmjs.org/@cloudflare/workerd-linux-64/-/workerd-linux-64-${version}.tgz" -o /tmp/workerd.tgz \
     && tar -xzf /tmp/workerd.tgz -C /tmp \
     && install -m 0755 /tmp/package/bin/workerd /usr/local/bin/workerd
 
