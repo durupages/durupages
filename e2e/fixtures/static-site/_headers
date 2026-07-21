@@ -1,0 +1,3 @@
+# Custom header applied to every static response, asserted by the e2e suite.
+/*
+  X-Duru-Test: static-header-ok

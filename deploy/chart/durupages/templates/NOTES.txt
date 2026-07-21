@@ -1,0 +1,44 @@
+DuruPages {{ .Chart.AppVersion }} has been deployed as release "{{ .Release.Name }}"
+in namespace "{{ .Release.Namespace }}".
+
+Components:
+  controller : {{ include "durupages.controller.name" . }}  (gRPC :{{ .Values.controller.service.port }}, replicas 1, Recreate)
+  router     : {{ include "durupages.router.name" . }}  (HTTP :{{ .Values.router.service.port }}, type {{ .Values.router.service.type }}, replicas {{ .Values.router.replicas }})
+  hub        : {{ include "durupages.hub.name" . }}  (bundle HTTP :{{ .Values.hub.service.httpPort }}, log gRPC :{{ .Values.hub.service.grpcPort }}, replicas {{ .Values.hub.replicas }})
+
+Worker pods are created at runtime by the controller in namespace "{{ .Values.workerNamespace }}"
+(ServiceAccount {{ .Values.workerServiceAccount }}, no token mounted). They are NOT part of this release.
+
+In-cluster addresses:
+  controller : {{ include "durupages.controllerAddr" . }}
+  hub bundle : {{ include "durupages.hubBundleAddr" . }}
+  hub log    : {{ include "durupages.hubLogAddr" . }} {{ if not .Values.logIngest.enabled }}(log ingest disabled -- pod-log mode){{ end }}
+
+{{- if .Values.workerJwt.existingSecret }}
+
+Worker JWT: using existing secret "{{ .Values.workerJwt.existingSecret }}"
+  (must contain keys "{{ .Values.workerJwt.privateKeyKey }}" and "{{ .Values.workerJwt.publicKeyKey }}").
+{{- else }}
+
+Worker JWT: managed by this chart (secret "{{ include "durupages.workerJwtSecretName" . }}").
+  These keys were passed in as values. To rotate/generate a keypair:
+
+    openssl genpkey -algorithm ed25519 -out worker-jwt.key
+    openssl pkey -in worker-jwt.key -pubout -out worker-jwt.pub
+
+  then upgrade with:
+
+    helm upgrade {{ .Release.Name }} <chart> \
+      --set-file workerJwt.privateKeyPEM=worker-jwt.key \
+      --set-file workerJwt.publicKeyPEM=worker-jwt.pub
+{{- end }}
+
+{{- if not .Values.networkPolicy.enabled }}
+
+WARNING: networkPolicy.enabled=false. Worker egress/ingress is NOT restricted.
+Only run this way if your CNI does not enforce NetworkPolicy.
+{{- end }}
+
+Verify the rollout:
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "durupages.controller.name" . }}
+  kubectl -n {{ .Release.Namespace }} get svc

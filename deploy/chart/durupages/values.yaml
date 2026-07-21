@@ -1,0 +1,269 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+# Default values for the durupages chart.
+# This chart installs the control/data plane (controller, router, hub) plus the
+# worker namespace, RBAC, NetworkPolicy and worker JWT key material.
+#
+# Worker pods are NOT created by this chart -- the controller creates them at
+# runtime. The chart only hands the worker image tag (worker.image) and a few
+# propagated tunables to the controller.
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the full release-qualified name used in resource names.
+fullnameOverride: ""
+
+# -- Cluster DNS domain, used to build in-cluster Service addresses.
+clusterDomain: cluster.local
+
+# -- Image pull secrets applied to every workload ServiceAccount / pod.
+imagePullSecrets: []
+# - name: my-registry-cred
+
+# =============================================================================
+# External dependencies (no bundled subcharts -- connection info only).
+# =============================================================================
+
+# PostgreSQL PageProvider connection. The controller receives the DSN through
+# DURUPAGES_PG_DSN (secretKeyRef). Provide either an existing secret OR an
+# inline dsn (which the chart stores in a managed Secret).
+postgres:
+  # -- Name of a pre-existing secret holding the DSN. Takes precedence over `dsn`.
+  existingSecret: ""
+  # -- Key within existingSecret that holds the DSN.
+  existingSecretKey: dsn
+  # -- Inline DSN, e.g. postgres://user:pass@host:5432/durupages?sslmode=require
+  #    Stored in a chart-managed Secret. Ignored when existingSecret is set.
+  dsn: ""
+
+# S3 (or MinIO) Storage used by router and hub. Credentials are optional -- when
+# omitted the AWS default credential chain (IRSA / instance profile) is used.
+s3:
+  # -- S3 endpoint. Empty uses the AWS default endpoint.
+  endpoint: ""
+  region: us-east-1
+  # -- Bucket name (required).
+  bucket: ""
+  # -- Path-style addressing (true for MinIO).
+  pathStyle: true
+  # -- Name of a pre-existing secret with access/secret keys. Takes precedence
+  #    over the inline accessKey/secretKey below.
+  existingSecret: ""
+  accessKeySecretKey: accessKey
+  secretKeySecretKey: secretKey
+  # -- Inline credentials. Stored in a chart-managed Secret. Leave both empty to
+  #    use the default AWS credential chain (no secretKeyRef injected).
+  accessKey: ""
+  secretKey: ""
+
+# =============================================================================
+# Worker JWT key material (Ed25519).
+# =============================================================================
+# The controller signs worker tokens with the private key; the hub verifies with
+# the public key. Helm CANNOT derive an Ed25519 public key from a private key, so
+# you MUST supply BOTH (or an existing secret). Generate with:
+#   openssl genpkey -algorithm ed25519 -out worker-jwt.key
+#   openssl pkey -in worker-jwt.key -pubout -out worker-jwt.pub
+workerJwt:
+  # -- Use an existing secret as-is. Must contain the two keys below.
+  existingSecret: ""
+  # -- Key name for the private PEM inside the secret (also the mounted filename).
+  privateKeyKey: worker-jwt.key
+  # -- Key name for the public PEM inside the secret (also the mounted filename).
+  publicKeyKey: worker-jwt.pub
+  # -- Inline Ed25519 private key PEM (PKCS#8). Required when existingSecret unset.
+  privateKeyPEM: ""
+  # -- Inline Ed25519 public key PEM. Required when existingSecret unset.
+  publicKeyPEM: ""
+
+# =============================================================================
+# Logging pipeline (hub log ingest). When disabled, shim/router emit pod logs
+# only and no hub log address is propagated.
+# =============================================================================
+logIngest:
+  enabled: false
+
+# =============================================================================
+# Worker pods (created by the controller at runtime).
+# =============================================================================
+# -- Namespace the controller creates worker pods in.
+workerNamespace: durupages-workers
+# -- Whether this chart creates the worker namespace (disable if pre-created).
+createWorkerNamespace: true
+# -- ServiceAccount name used by worker pods (no permissions, token not mounted).
+workerServiceAccount: durupages-worker-noperm
+
+worker:
+  # -- Worker image (shim + durupages-workerd) the controller stamps onto pods.
+  image:
+    repository: durupages/worker
+    tag: ""            # defaults to .Chart.AppVersion
+  # -- Default per-tenant worker pod CPU limit (overridable per tenant).
+  cpuLimit: "1"
+  # -- Default per-tenant worker pod memory limit.
+  memLimit: "512Mi"
+  # -- Deployment LRU eviction min idle time propagated to worker pods (empty = shim default 1h).
+  bundleMinIdle: ""
+  # -- Worker bundle disk cache cap propagated to worker pods (empty = shim default 2GiB).
+  bundleCacheMaxBytes: ""
+
+# NetworkPolicy applied in the worker namespace (see ARCHITECTURE section 8).
+# Toggle off if your CNI does not enforce NetworkPolicy.
+networkPolicy:
+  enabled: true
+  # -- Cluster pod/service CIDRs to EXCLUDE from the worker "external internet"
+  #    egress allowance (so workers cannot reach arbitrary in-cluster IPs).
+  clusterCIDRs:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  # -- kube-dns / CoreDNS namespace and selector for the DNS egress rule.
+  dns:
+    namespace: kube-system
+    # Pod selector matching the DNS pods (CoreDNS default label).
+    podSelector:
+      k8s-app: kube-dns
+  # -- Namespaces allowed to reach worker pods on ingress (router + controller).
+  #    By default the release namespace is used; override if router/controller
+  #    live elsewhere. Matched by the kubernetes.io/metadata.name label.
+  allowedIngressNamespaces: []
+
+# =============================================================================
+# controller
+# =============================================================================
+controller:
+  image:
+    repository: durupages/controller
+    tag: ""            # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  # controller must be a single replica (in-memory queue); strategy Recreate.
+  replicas: 1
+  service:
+    port: 9440
+  # -- Pages domain, e.g. pages.example.com
+  pagesDomain: pages.local
+  # -- Apply PostgreSQL schema migrations on start.
+  migrate: true
+  # timeouts / concurrency (no env equivalents -- passed as flags)
+  defaultQueueTimeout: 30s
+  maxQueueTimeout: 120s
+  defaultRequestTimeout: 60s
+  defaultMaxConcurrency: 5
+  maxConcurrencyPerPod: 256
+  targetConcurrencyPerPod: 32
+  defaultIdleTTL: 60s
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# =============================================================================
+# router
+# =============================================================================
+router:
+  image:
+    repository: durupages/router
+    tag: ""            # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  replicas: 2
+  service:
+    # ClusterIP | NodePort | LoadBalancer
+    type: ClusterIP
+    port: 8080
+    # nodePort: 30080          # used only when type=NodePort
+    annotations: {}
+  # -- Pages domain, e.g. pages.example.com
+  pagesDomain: pages.local
+  # static LRU cache
+  staticCacheDir: /var/cache/durupages
+  staticCacheMaxBytes: 1073741824   # 1GiB
+  staticCacheSize: 2Gi              # emptyDir sizeLimit (>= staticCacheMaxBytes)
+  resolveCacheTTL: 10s
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+
+# =============================================================================
+# hub
+# =============================================================================
+hub:
+  image:
+    repository: durupages/hub
+    tag: ""            # defaults to .Chart.AppVersion
+    pullPolicy: IfNotPresent
+  replicas: 1
+  service:
+    httpPort: 9080     # bundle distribution (HTTP)
+    grpcPort: 9443     # log ingest (gRPC)
+  bundleCacheDir: /var/cache/durupages-hub
+  bundleCacheMaxBytes: 4294967296   # 4GiB
+  bundleCacheSize: 8Gi              # emptyDir sizeLimit (>= bundleCacheMaxBytes)
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  podAnnotations: {}
+  podLabels: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podSecurityContext:
+    runAsNonRoot: true
+    runAsUser: 65532
+    runAsGroup: 65532
+    fsGroup: 65532
+    seccompProfile:
+      type: RuntimeDefault
+  securityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL

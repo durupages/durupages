@@ -1,0 +1,106 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "durupages.router.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" . "component" "router") | nindent 4 }}
+  {{- with .Values.router.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.router.service.type }}
+  ports:
+    - name: http
+      port: {{ .Values.router.service.port }}
+      targetPort: http
+      protocol: TCP
+      {{- if and (eq .Values.router.service.type "NodePort") .Values.router.service.nodePort }}
+      nodePort: {{ .Values.router.service.nodePort }}
+      {{- end }}
+  selector:
+    {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "router") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "durupages.router.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" . "component" "router") | nindent 4 }}
+spec:
+  replicas: {{ .Values.router.replicas }}
+  selector:
+    matchLabels:
+      {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "router") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "durupages.componentLabels" (dict "root" . "component" "router") | nindent 8 }}
+        {{- with .Values.router.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      {{- with .Values.router.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.router.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: router
+          image: "{{ .Values.router.image.repository }}:{{ .Values.router.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.router.image.pullPolicy }}
+          args:
+            - --resolve-cache-ttl={{ .Values.router.resolveCacheTTL }}
+          env:
+            - name: DURUPAGES_LISTEN
+              value: ":{{ .Values.router.service.port }}"
+            - name: DURUPAGES_CONTROLLER_ADDR
+              value: {{ include "durupages.controllerAddr" . | quote }}
+            {{- if .Values.logIngest.enabled }}
+            - name: DURUPAGES_HUB_LOG_ADDR
+              value: {{ include "durupages.hubLogAddr" . | quote }}
+            {{- end }}
+            - name: DURUPAGES_PAGES_DOMAIN
+              value: {{ .Values.router.pagesDomain | quote }}
+            - name: DURUPAGES_STATIC_CACHE_DIR
+              value: {{ .Values.router.staticCacheDir | quote }}
+            - name: DURUPAGES_STATIC_CACHE_MAX_BYTES
+              value: {{ .Values.router.staticCacheMaxBytes | quote }}
+            {{- include "durupages.s3Env" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.router.service.port }}
+              protocol: TCP
+          {{- with .Values.router.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.router.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: static-cache
+              mountPath: {{ .Values.router.staticCacheDir }}
+      volumes:
+        - name: static-cache
+          emptyDir:
+            sizeLimit: {{ .Values.router.staticCacheSize }}
+      {{- with .Values.router.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.router.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.router.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

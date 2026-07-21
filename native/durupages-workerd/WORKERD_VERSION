@@ -1,0 +1,9 @@
+# Pinned workerd revision the patch applies against.
+# Update these three together when bumping workerd.
+WORKERD_REF=b94c075
+WORKERD_RELEASE=2026-07-21
+# Upstream workerd release version (npm/release form 1.YYYYMMDD.PATCH) that
+# WORKERD_REF corresponds to. The workerd build workflow combines it with the
+# manual `revision` input to produce the image tag v${WORKERD_UPSTREAM_VERSION}-duru${revision}
+# (e.g. v1.20260721.1-duru1).
+WORKERD_UPSTREAM_VERSION=1.20260721.1

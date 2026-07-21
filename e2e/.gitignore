@@ -1,0 +1,4 @@
+# Generated at e2e runtime — never commit.
+.keys/
+.kube/
+.build/

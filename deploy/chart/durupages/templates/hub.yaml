@@ -1,0 +1,108 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "durupages.hub.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" . "component" "hub") | nindent 4 }}
+spec:
+  type: ClusterIP
+  ports:
+    - name: http
+      port: {{ .Values.hub.service.httpPort }}
+      targetPort: http
+      protocol: TCP
+    - name: grpc
+      port: {{ .Values.hub.service.grpcPort }}
+      targetPort: grpc
+      protocol: TCP
+  selector:
+    {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "hub") | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "durupages.hub.name" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" . "component" "hub") | nindent 4 }}
+spec:
+  replicas: {{ .Values.hub.replicas }}
+  selector:
+    matchLabels:
+      {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "hub") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "durupages.componentLabels" (dict "root" . "component" "hub") | nindent 8 }}
+        {{- with .Values.hub.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
+      annotations:
+        checksum/worker-jwt: {{ include "durupages.workerJwtSecretName" . | sha256sum }}
+        {{- with .Values.hub.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
+    spec:
+      {{- with .Values.hub.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: hub
+          image: "{{ .Values.hub.image.repository }}:{{ .Values.hub.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.hub.image.pullPolicy }}
+          args:
+            - --worker-jwt-pubkey=/etc/durupages/worker-jwt/{{ .Values.workerJwt.publicKeyKey }}
+          env:
+            - name: DURUPAGES_LISTEN_HTTP
+              value: ":{{ .Values.hub.service.httpPort }}"
+            - name: DURUPAGES_LISTEN_GRPC
+              value: ":{{ .Values.hub.service.grpcPort }}"
+            - name: DURUPAGES_BUNDLE_CACHE_DIR
+              value: {{ .Values.hub.bundleCacheDir | quote }}
+            - name: DURUPAGES_BUNDLE_CACHE_MAX_BYTES
+              value: {{ .Values.hub.bundleCacheMaxBytes | quote }}
+            {{- include "durupages.s3Env" . | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.hub.service.httpPort }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.hub.service.grpcPort }}
+              protocol: TCP
+          {{- with .Values.hub.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.hub.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: worker-jwt
+              mountPath: /etc/durupages/worker-jwt
+              readOnly: true
+            - name: bundle-cache
+              mountPath: {{ .Values.hub.bundleCacheDir }}
+      volumes:
+        - name: worker-jwt
+          secret:
+            secretName: {{ include "durupages.workerJwtSecretName" . }}
+            items:
+              - key: {{ .Values.workerJwt.publicKeyKey }}
+                path: {{ .Values.workerJwt.publicKeyKey }}
+        - name: bundle-cache
+          emptyDir:
+            sizeLimit: {{ .Values.hub.bundleCacheSize }}
+      {{- with .Values.hub.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hub.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.hub.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

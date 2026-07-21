@@ -1,0 +1,2 @@
+# Permanent redirect used by the e2e suite.
+/old /contact.html 301

@@ -1,0 +1,23 @@
+export default {
+  async fetch(request, env) {
+    const page = request.headers.get("X-DuruPages-Page");
+    if (!page) {
+      return new Response("missing page header", { status: 404 });
+    }
+    // A workerd "json =" binding exposes the PARSED value (an object), not a
+    // JSON string — never JSON.parse it. Accept a string defensively anyway.
+    let routes = env.ROUTES;
+    if (typeof routes === "string") {
+      try { routes = JSON.parse(routes); } catch (e) { routes = null; }
+    }
+    if (!routes || typeof routes !== "object") {
+      return new Response("bad routes binding", { status: 500 });
+    }
+    const binding = routes[page];
+    const svc = binding ? env[binding] : undefined;
+    if (!svc) {
+      return new Response("unknown page", { status: 404 });
+    }
+    return svc.fetch(request);
+  }
+};

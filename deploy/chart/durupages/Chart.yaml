@@ -1,0 +1,23 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+apiVersion: v2
+name: durupages
+description: >-
+  DuruPages control/data plane (controller, router, hub) plus the worker
+  namespace, RBAC, NetworkPolicy and worker JWT keys. Worker pods themselves
+  are created at runtime by the controller, not by this chart.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.21.0-0"
+home: https://github.com/durupages/durupages
+sources:
+  - https://github.com/durupages/durupages
+keywords:
+  - durupages
+  - cloudflare-pages
+  - workerd
+  - edge
+maintainers:
+  - name: DuruPages

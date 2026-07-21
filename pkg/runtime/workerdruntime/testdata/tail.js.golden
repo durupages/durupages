@@ -1,0 +1,70 @@
+export default {
+  async tail(events, env) {
+    try {
+      const payload = events.map(toRecord);
+      await fetch(env.TAIL_ENDPOINT, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(payload)
+      });
+    } catch (e) {
+      // best-effort: swallow delivery errors.
+    }
+  }
+};
+
+function toRecord(item) {
+  const rec = {
+    scriptName: item.scriptName || "",
+    outcome: item.outcome || "",
+    cpuTime: item.cpuTime || 0,
+    wallTime: item.wallTime || 0,
+    logs: [],
+    exceptions: []
+  };
+  for (const log of item.logs || []) {
+    rec.logs.push({
+      timestamp: log.timestamp || 0,
+      level: log.level || "log",
+      message: messageToString(log.message)
+    });
+  }
+  for (const exc of item.exceptions || []) {
+    rec.exceptions.push({
+      timestamp: exc.timestamp || 0,
+      name: exc.name || "",
+      message: exc.message || "",
+      stack: exc.stack || ""
+    });
+  }
+  const ev = item.event;
+  if (ev && ev.request) {
+    rec.event = {
+      request: {
+        url: ev.request.url || "",
+        method: ev.request.method || "",
+        headers: headersToObject(ev.request.headers)
+      },
+      response: ev.response ? { status: ev.response.status || 0 } : null
+    };
+  } else {
+    rec.event = null;
+  }
+  return rec;
+}
+
+function headersToObject(h) {
+  const out = {};
+  if (!h) return out;
+  if (typeof h.forEach === "function") {
+    h.forEach((value, key) => { out[key] = value; });
+  } else {
+    for (const key of Object.keys(h)) { out[key] = h[key]; }
+  }
+  return out;
+}
+
+function messageToString(m) {
+  if (typeof m === "string") return m;
+  try { return JSON.stringify(m); } catch (e) { return String(m); }
+}

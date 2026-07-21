@@ -1,0 +1,195 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+name: Release
+
+on:
+  push:
+    tags:
+      # Coarse glob; the `validate` job below enforces the exact grammar.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  GOFLAGS: -buildvcs=false
+
+jobs:
+  # Fail fast if the tag does not match the exact accepted grammar, and expose
+  # the parsed version pieces to downstream jobs.
+  validate:
+    name: validate tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+      version_no_v: ${{ steps.parse.outputs.version_no_v }}
+      prerelease: ${{ steps.parse.outputs.prerelease }}
+    steps:
+      - id: parse
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if ! echo "$TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::Tag '$TAG' does not match ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$"
+            exit 1
+          fi
+          echo "version=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=${TAG#v}" >> "$GITHUB_OUTPUT"
+          case "$TAG" in
+            *-*) echo "prerelease=true"  >> "$GITHUB_OUTPUT" ;;
+            *)   echo "prerelease=false" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # Go cross-compiles cleanly, so a single amd64 runner builds every binary for
+  # both linux/amd64 and linux/arm64 (no QEMU, no per-arch runners). The version
+  # is stamped in via -ldflags -X internal/version.*. Binaries land under dist/
+  # and are uploaded for the image and release jobs to consume.
+  build-binaries:
+    name: cross-compile binaries
+    needs: validate
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile (amd64 + arm64)
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          MOD=github.com/durupages/durupages/internal/version
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X ${MOD}.Version=${VERSION} -X ${MOD}.Commit=${GITHUB_SHA} -X ${MOD}.Date=${DATE}"
+          # worker-shim/duru are shipped as release assets; images use the first three.
+          COMPONENTS="durupages-controller durupages-router durupages-hub durupages-worker-shim duru"
+          for arch in amd64 arm64; do
+            for c in ${COMPONENTS}; do
+              out="dist/linux/${arch}/${c}"
+              echo "building ${out}"
+              CGO_ENABLED=0 GOOS=linux GOARCH="${arch}" \
+                go build -trimpath -ldflags "${LDFLAGS}" -o "${out}" "./cmd/${c}"
+            done
+          done
+          # Sanity-check the stamped version on the native (amd64) build.
+          ./dist/linux/amd64/durupages-controller --version
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 7
+
+  # Package the prebuilt binaries into multi-arch images. deploy/Dockerfile.dist
+  # only COPYs binaries (no Go build), so one buildx invocation produces a
+  # linux/amd64+arm64 manifest without emulation.
+  #
+  # `worker` is intentionally excluded: its image bundles workerd and is built
+  # by the separate, manually-triggered workerd.yml workflow.
+  images:
+    name: image ${{ matrix.component }}
+    needs: [validate, build-binaries]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [controller, router, hub]
+    env:
+      REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/durupages-${{ matrix.component }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+
+      - name: Make binaries executable
+        # upload/download-artifact does not preserve the +x bit.
+        run: chmod -R +x dist/linux || true
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY_IMAGE }}
+          flavor: |
+            latest=false
+          tags: |
+            type=raw,value=${{ needs.validate.outputs.version }}
+            type=raw,value=${{ needs.validate.outputs.version_no_v }}
+            type=raw,value=latest,enable=${{ needs.validate.outputs.prerelease == 'false' }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push multi-arch image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./deploy/Dockerfile.dist
+          target: ${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: |
+            ${{ steps.meta.outputs.labels }}
+            org.opencontainers.image.title=durupages-${{ matrix.component }}
+            org.opencontainers.image.version=${{ needs.validate.outputs.version }}
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect ${{ env.REGISTRY_IMAGE }}:${{ needs.validate.outputs.version }}
+
+  release:
+    name: github release
+    needs: [validate, build-binaries, images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries
+          path: dist
+
+      - name: Package release assets
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          set -euo pipefail
+          chmod -R +x dist/linux || true
+          mkdir -p assets
+          for arch in amd64 arm64; do
+            tar -C "dist/linux/${arch}" -czf "assets/durupages_${VERSION}_linux_${arch}.tar.gz" .
+          done
+          (cd assets && sha256sum *.tar.gz > SHA256SUMS)
+          ls -la assets
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
+          files: |
+            assets/*.tar.gz
+            assets/SHA256SUMS

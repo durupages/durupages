@@ -1,0 +1,90 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+{{- if .Values.networkPolicy.enabled }}
+# Default-deny for worker pods (ARCHITECTURE section 8):
+#   ingress  : only from router + controller
+#   egress   : only to controller + hub Services, DNS, and the external internet
+#              (cluster CIDRs and the metadata endpoint are excluded).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "durupages.fullname" . }}-worker
+  namespace: {{ .Values.workerNamespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: durupages-worker
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # From the controller (lease/heartbeat) and the router (request proxy).
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "controller") | nindent 14 }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "router") | nindent 14 }}
+        {{- range .Values.networkPolicy.allowedIngressNamespaces }}
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ . }}
+        {{- end }}
+  egress:
+    # DNS resolution (kube-dns / CoreDNS).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.networkPolicy.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.networkPolicy.dns.podSelector | nindent 14 }}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+    # Controller (register / heartbeat).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "controller") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.controller.service.port }}
+    # Hub (bundle download + optional log ingest).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "hub") | nindent 14 }}
+      ports:
+        - protocol: TCP
+          port: {{ .Values.hub.service.httpPort }}
+        - protocol: TCP
+          port: {{ .Values.hub.service.grpcPort }}
+    # External internet, excluding the cluster CIDRs and the metadata endpoint.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range .Values.networkPolicy.clusterCIDRs }}
+              - {{ . }}
+              {{- end }}
+              - 169.254.169.254/32
+{{- end }}

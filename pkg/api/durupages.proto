@@ -1,0 +1,152 @@
+// Copyright 2026 JC-Lab
+// SPDX-License-Identifier: EPL-2.0
+
+syntax = "proto3";
+
+package durupages.v1;
+
+option go_package = "github.com/durupages/durupages/pkg/api;api";
+
+// ---------------------------------------------------------------------------
+// router <-> controller
+// ---------------------------------------------------------------------------
+
+service RouterService {
+  // ResolvePage maps a request host to its page/tenant/deployment.
+  rpc ResolvePage(ResolvePageRequest) returns (ResolvePageResponse);
+  // AcquireSlot enqueues a request for a tenant worker slot and streams
+  // QUEUED -> GRANTED (or TIMEOUT). Closing the stream cancels the wait.
+  rpc AcquireSlot(AcquireSlotRequest) returns (stream AcquireSlotEvent);
+  rpc ReleaseSlot(ReleaseSlotRequest) returns (ReleaseSlotResponse);
+}
+
+message ResolvePageRequest {
+  string host = 1;
+}
+
+message ResolvePageResponse {
+  PageInfo page = 1;
+  // cache TTL for the router's resolve cache.
+  int64 ttl_seconds = 2;
+}
+
+message PageInfo {
+  string page_id = 1;
+  string tenant_id = 2;
+  string active_deployment_id = 3;
+  bool has_worker = 4;
+}
+
+message AcquireSlotRequest {
+  string tenant_id = 1;
+  string page_id = 2;
+}
+
+message Lease {
+  string lease_id = 1;
+  // endpoint is the worker shim address (host:port) to proxy to.
+  string endpoint = 2;
+  string page_id = 3;
+  // deployment_id is the page's active deployment at issuance time; the shim
+  // lazy-loads / hot-updates based on this value.
+  string deployment_id = 4;
+  int64 deadline_unix_ms = 5;
+  // request_id correlates usage events and response headers.
+  string request_id = 6;
+  // signature authenticates the lease towards the worker shim.
+  string signature = 7;
+}
+
+message AcquireSlotEvent {
+  oneof event {
+    Queued queued = 1;
+    Lease granted = 2;
+    Timeout timeout = 3;
+  }
+  message Queued {
+    int64 position = 1;
+  }
+  message Timeout {}
+}
+
+message ReleaseSlotRequest {
+  string lease_id = 1;
+}
+
+message ReleaseSlotResponse {}
+
+// ---------------------------------------------------------------------------
+// worker shim <-> controller
+// ---------------------------------------------------------------------------
+
+service WorkerService {
+  // Register reports shim startup; the pod becomes Ready immediately after
+  // (no bundles are preloaded — loading is lease-driven).
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+  // Heartbeat reports liveness/state; responses carry drain instructions and
+  // JWT renewals.
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+  // GetPageConfig returns a page's Env/Secret bindings. The shim calls it
+  // while lazy-loading a page bundle; the page must belong to the worker
+  // JWT's tenant.
+  rpc GetPageConfig(GetPageConfigRequest) returns (GetPageConfigResponse);
+}
+
+message GetPageConfigRequest {
+  string page_id = 1;
+}
+
+message GetPageConfigResponse {
+  map<string, string> env = 1;
+  map<string, string> secret = 2;
+}
+
+message RegisterRequest {
+  string tenant_id = 1;
+  string pod_name = 2;
+  // endpoint the shim serves requests on (host:port).
+  string endpoint = 3;
+}
+
+message RegisterResponse {
+  int64 heartbeat_interval_seconds = 1;
+}
+
+message LoadedPage {
+  string page_id = 1;
+  string deployment_id = 2;
+}
+
+message HeartbeatRequest {
+  // state: "ready" | "serving" | "idle" | "draining".
+  string state = 1;
+  int64 in_flight = 2;
+  repeated LoadedPage loaded_pages = 3;
+}
+
+message HeartbeatResponse {
+  // drain instructs the shim to stop accepting leases and finish in-flight.
+  bool drain = 1;
+  // renewed_jwt replaces the worker JWT before expiry (empty = keep).
+  string renewed_jwt = 2;
+}
+
+// ---------------------------------------------------------------------------
+// shim/router -> hub (log ingest)
+// ---------------------------------------------------------------------------
+
+service LogService {
+  rpc Ingest(stream IngestBatch) returns (stream IngestAck);
+}
+
+message IngestBatch {
+  int64 batch_id = 1;
+  // Events serialized with the pkg/usage JSON schema (single source of truth
+  // shared with the pod-log JSON Lines format).
+  repeated bytes request_usage_json = 2;
+  repeated bytes static_access_json = 3;
+}
+
+message IngestAck {
+  int64 batch_id = 1;
+}

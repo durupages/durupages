@@ -1,0 +1,161 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+name: Build durupages-workerd
+
+# Builds the custom workerd embedder (native/durupages-workerd) and, optionally,
+# the `worker-native` container image that bundles it. This is DELIBERATELY
+# separate from the tag-driven Release workflow: workerd is heavy to build
+# (V8 from source) and versions on its own cadence, so it is triggered manually.
+#
+# The image is tagged  v${WORKERD_UPSTREAM_VERSION}-duru${revision}
+# where WORKERD_UPSTREAM_VERSION comes from native/durupages-workerd/WORKERD_VERSION
+# and ${revision} is the manual input. Example: v1.20260721.1-duru1.
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: 'DuruPages revision number (the N in -duruN)'
+        required: true
+        type: string
+      push_image:
+        description: 'Build and push the worker-native image to GHCR'
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: workerd-build
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build durupages-workerd
+    runs-on: ubuntu-latest
+    # V8 is compiled from source on the first run for a given workerd ref; the
+    # bazel disk cache (restored below) makes later runs fast.
+    timeout-minutes: 360
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute version
+        id: version
+        env:
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          # Revision must be a bare number so the tag stays well-formed.
+          if ! echo "$REVISION" | grep -Eq '^[0-9]+$'; then
+            echo "::error::revision '$REVISION' must be a non-negative integer"
+            exit 1
+          fi
+          # shellcheck disable=SC1091
+          source native/durupages-workerd/WORKERD_VERSION
+          if [ -z "${WORKERD_UPSTREAM_VERSION:-}" ]; then
+            echo "::error::WORKERD_UPSTREAM_VERSION missing from WORKERD_VERSION"
+            exit 1
+          fi
+          VERSION="v${WORKERD_UPSTREAM_VERSION}-duru${REVISION}"
+          echo "Building $VERSION (workerd ref ${WORKERD_REF})"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "workerd_ref=$WORKERD_REF" >> "$GITHUB_OUTPUT"
+
+      - name: Free disk space
+        # A full workerd + V8 build needs far more than the ~14 GB free on a
+        # stock runner; reclaim the large preinstalled toolchains we do not use.
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      "$AGENT_TOOLSDIRECTORY" || true
+          df -h /
+
+      - name: Install build toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # clang/clang++ (C++23), lld (ld.lld) and tclsh (sqlite codegen).
+          sudo apt-get install -y --no-install-recommends clang lld tcl git ca-certificates
+          # bazelisk honours the repo's .bazelversion and fetches the right bazel.
+          sudo curl -fsSL -o /usr/local/bin/bazelisk \
+            https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64
+          sudo chmod +x /usr/local/bin/bazelisk
+          clang --version | head -1
+          bazelisk version || true
+
+      - name: Restore bazel disk cache
+        uses: actions/cache@v4
+        with:
+          # build.sh points its --disk_cache here; keyed by the workerd ref so a
+          # repin gets a fresh cache while same-ref rebuilds stay warm.
+          path: ~/.cache/durupages-workerd
+          key: workerd-diskcache-${{ steps.version.outputs.workerd_ref }}
+          restore-keys: |
+            workerd-diskcache-
+
+      - name: Build durupages-workerd
+        env:
+          DURUPAGES_BAZEL: bazelisk
+          # ubuntu-latest has 4 cores / 16 GB RAM; keep memory pressure sane.
+          DURUPAGES_BUILD_JOBS: '4'
+          DURUPAGES_BUILD_MEM_MB: '12000'
+        run: |
+          ./native/durupages-workerd/build.sh
+          ./native/durupages-workerd/bin/durupages-workerd --version
+
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: durupages-workerd-${{ steps.version.outputs.version }}
+          path: native/durupages-workerd/bin/durupages-workerd
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Log in to GHCR
+        if: ${{ inputs.push_image }}
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        if: ${{ inputs.push_image }}
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build & push worker-native image
+        if: ${{ inputs.push_image }}
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: worker-native
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/durupages-worker:${{ steps.version.outputs.version }}
+          labels: |
+            org.opencontainers.image.title=durupages-worker
+            org.opencontainers.image.description=DuruPages worker (shim + durupages-workerd)
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Summary
+        run: |
+          {
+            echo "## durupages-workerd ${{ steps.version.outputs.version }}"
+            echo ""
+            echo "- workerd ref: \`${{ steps.version.outputs.workerd_ref }}\`"
+            echo "- binary artifact: durupages-workerd-${{ steps.version.outputs.version }}"
+            if [ "${{ inputs.push_image }}" = "true" ]; then
+              echo "- image: \`ghcr.io/${{ github.repository_owner }}/durupages-worker:${{ steps.version.outputs.version }}\`"
+            else
+              echo "- image: not pushed (push_image=false)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,193 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+# DuruPages integration/e2e environment (see docs/ARCHITECTURE.md section 12).
+#
+# Bring this up with `make e2e-up` / `scripts/e2e-up.sh`, which builds the
+# component images, imports the worker image into k3s and rewrites the
+# kubeconfig before starting the control/data plane. Running `docker-compose up`
+# by hand will NOT work on its own — the worker image import and kubeconfig
+# rewrite are done by the script.
+#
+# Networking. Worker pods run inside k3s and egress via k3s NAT; compose DNS
+# names do not resolve from inside pods. So the controller advertises IP-based
+# addresses for the controller and hub (172.28.0.10 / 172.28.0.11), which are
+# pinned via the durunet ipam block. The router reaches worker pod IPs
+# (10.42.0.0/16) through a route via the k3s node (see e2e/router-net).
+
+networks:
+  durunet:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.28.0.0/16
+          gateway: 172.28.0.1
+
+volumes:
+  k3s-server:
+  minio-data:
+  pg-data:
+
+services:
+  k3s:
+    image: rancher/k3s:v1.30.6-k3s1
+    container_name: durupages-k3s
+    privileged: true
+    command:
+      - server
+      - --disable=traefik
+      - --disable=servicelb
+      - --disable=metrics-server
+      - --flannel-backend=host-gw
+      - --node-ip=172.28.0.5
+      - --tls-san=172.28.0.5
+    environment:
+      - K3S_TOKEN=e2e-durupages-token
+      - K3S_KUBECONFIG_OUTPUT=/output/kubeconfig.yaml
+      - K3S_KUBECONFIG_MODE=0644
+    tmpfs:
+      - /run
+      - /var/run
+    volumes:
+      - k3s-server:/var/lib/rancher/k3s
+      - ./e2e/.kube:/output
+    networks:
+      durunet:
+        ipv4_address: 172.28.0.5
+    ports:
+      - "6443:6443"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: durupages-postgres
+    environment:
+      POSTGRES_USER: duru
+      POSTGRES_PASSWORD: duru
+      POSTGRES_DB: duru
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - durunet
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U duru -d duru"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  minio:
+    image: minio/minio:latest
+    container_name: durupages-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    networks:
+      - durunet
+    ports:
+      - "59000:9000"
+
+  # One-shot: create the deployment bucket in MinIO. The e2e-up script gates this
+  # on MinIO readiness (host-side health probe) before invoking it; the minio
+  # image itself ships no shell tooling for a container healthcheck.
+  minio-setup:
+    image: minio/mc:latest
+    container_name: durupages-minio-setup
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint:
+      - sh
+      - -c
+      - >
+        mc alias set local http://minio:9000 minioadmin minioadmin &&
+        mc mb -p local/durupages &&
+        echo "durupages bucket ready"
+    networks:
+      - durunet
+    restart: "no"
+
+  hub:
+    image: durupages/hub:e2e
+    container_name: durupages-hub
+    depends_on:
+      minio-setup:
+        condition: service_completed_successfully
+    command:
+      - --listen-http=:9080
+      - --listen-grpc=:9443
+      - --s3-endpoint=http://minio:9000
+      - --s3-region=us-east-1
+      - --s3-bucket=durupages
+      - --s3-access-key=minioadmin
+      - --s3-secret-key=minioadmin
+      - --s3-path-style=true
+      - --worker-jwt-pubkey=/keys/jwt-pub.pem
+      - --bundle-cache-dir=/tmp/hub-cache
+    volumes:
+      - ./e2e/.keys:/keys:ro
+    networks:
+      durunet:
+        ipv4_address: 172.28.0.11
+
+  controller:
+    image: durupages/controller:e2e
+    container_name: durupages-controller
+    depends_on:
+      postgres:
+        condition: service_healthy
+      hub:
+        condition: service_started
+    command:
+      - --listen=:9440
+      - --pg-dsn=postgres://duru:duru@postgres:5432/duru?sslmode=disable
+      - --pages-domain=pages.local
+      - --worker-jwt-signing-key=/keys/jwt-priv.pem
+      - --controller-addr=172.28.0.10:9440
+      - --hub-addr=http://172.28.0.11:9080
+      - --worker-image=durupages/worker:e2e
+      - --worker-namespace=durupages-workers
+      - --worker-service-account=default
+      - --kubeconfig=/kube/kubeconfig.yaml
+      - --default-idle-ttl=10m
+    environment:
+      - KUBECONFIG=/kube/kubeconfig.yaml
+    volumes:
+      - ./e2e/.keys:/keys:ro
+      - ./e2e/.kube:/kube:ro
+    networks:
+      durunet:
+        ipv4_address: 172.28.0.10
+
+  router:
+    # Image is built by scripts/e2e-up.sh with `docker build` (which resolves the
+    # local durupages/router:e2e base). Compose's builder tries to pull that base
+    # from a registry, so we pre-build and reference the image here.
+    image: durupages/router-net:e2e
+    container_name: durupages-router
+    depends_on:
+      controller:
+        condition: service_started
+      minio-setup:
+        condition: service_completed_successfully
+    cap_add:
+      - NET_ADMIN
+    environment:
+      - K3S_NODE_IP=172.28.0.5
+      - POD_CIDR=10.42.0.0/16
+      - DURUPAGES_CONTROLLER_ADDR=controller:9440
+      - DURUPAGES_PAGES_DOMAIN=pages.local
+      - DURUPAGES_STATIC_CACHE_DIR=/tmp/router-cache
+      - DURUPAGES_S3_ENDPOINT=http://minio:9000
+      - DURUPAGES_S3_REGION=us-east-1
+      - DURUPAGES_S3_BUCKET=durupages
+      - DURUPAGES_S3_ACCESS_KEY=minioadmin
+      - DURUPAGES_S3_SECRET_KEY=minioadmin
+      - DURUPAGES_S3_PATH_STYLE=true
+    networks:
+      - durunet
+    ports:
+      - "18080:8080"

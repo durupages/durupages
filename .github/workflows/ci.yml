@@ -1,0 +1,72 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+name: CI
+
+# Runs on every push to main and on all pull requests.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs for the same ref (branch/PR) to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # The repo has no VCS stamping needs in CI and the checkout is not always a
+  # full git tree; disabling buildvcs avoids spurious build failures.
+  GOFLAGS: -buildvcs=false
+
+jobs:
+  test:
+    name: build & test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test (race)
+        run: go test -race ./...
+
+  lint:
+    name: lint (gofmt + vet)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # gofmt check. Generated protobuf files (*.pb.go) are excluded because
+      # the code generators own their formatting and we do not hand-edit them.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l . | grep -v '\.pb\.go$' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "The following files are not gofmt-clean:"
+            echo "$unformatted"
+            echo "Run: gofmt -w <file>"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...

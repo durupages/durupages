@@ -1,0 +1,30 @@
+# syntax=docker/dockerfile:1
+# Release Dockerfile: package PREBUILT binaries into images. No Go build here —
+# the Release workflow cross-compiles the binaries (amd64 + arm64) with version
+# ldflags and drops them under dist/, then buildx assembles multi-arch images by
+# COPYing the per-arch binary. Because COPY never executes the binary, the
+# multi-arch build needs no QEMU emulation.
+#
+# Expected build context layout (produced by the workflow):
+#   dist/linux/amd64/durupages-<component>
+#   dist/linux/arm64/durupages-<component>
+#
+# buildx sets TARGETARCH per platform (amd64 / arm64).
+#
+#   docker buildx build -f deploy/Dockerfile.dist --target controller \
+#       --platform linux/amd64,linux/arm64 .
+
+FROM gcr.io/distroless/static-debian12:nonroot AS controller
+ARG TARGETARCH
+COPY dist/linux/${TARGETARCH}/durupages-controller /durupages-controller
+ENTRYPOINT ["/durupages-controller"]
+
+FROM gcr.io/distroless/static-debian12:nonroot AS router
+ARG TARGETARCH
+COPY dist/linux/${TARGETARCH}/durupages-router /durupages-router
+ENTRYPOINT ["/durupages-router"]
+
+FROM gcr.io/distroless/static-debian12:nonroot AS hub
+ARG TARGETARCH
+COPY dist/linux/${TARGETARCH}/durupages-hub /durupages-hub
+ENTRYPOINT ["/durupages-hub"]
