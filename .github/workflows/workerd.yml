@@ -90,7 +90,7 @@ jobs:
           bazelisk version || true
 
       - name: Restore bazel disk cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           # build.sh points its --disk_cache here; keyed by the workerd ref so a
           # repin gets a fresh cache while same-ref rebuilds stay warm.
