@@ -75,9 +75,9 @@ scenario "1. Static site (serve / 404 / redirect / header)"
 
 curl_get "static.${PAGES_DOMAIN}" "/"
 if [[ "${CODE}" == "200" ]] && grep -q "DURUPAGES_STATIC_INDEX_OK" "${BODY}"; then
-  c_pass "GET / -> 200 index.html"
+  c_pass "GET / -> 200 index.html (${TIME}s)"
 else
-  c_fail "GET / -> got ${CODE}, body: $(head -c120 "${BODY}")"
+  c_fail "GET / -> got ${CODE} in ${TIME}s, body: $(head -c120 "${BODY}")"
 fi
 
 if grep -qi '^X-Duru-Test: static-header-ok' "${HDRS}"; then
@@ -88,17 +88,17 @@ fi
 
 curl_get "static.${PAGES_DOMAIN}" "/does-not-exist"
 if [[ "${CODE}" == "404" ]] && grep -q "DURUPAGES_STATIC_404_OK" "${BODY}"; then
-  c_pass "GET /does-not-exist -> 404 404.html"
+  c_pass "GET /does-not-exist -> 404 404.html (${TIME}s)"
 else
-  c_fail "unknown path -> got ${CODE}, body: $(head -c120 "${BODY}")"
+  c_fail "unknown path -> got ${CODE} in ${TIME}s, body: $(head -c120 "${BODY}")"
 fi
 
 curl_get "static.${PAGES_DOMAIN}" "/old"
 LOC="$(grep -i '^Location:' "${HDRS}" | tr -d '\r' | awk '{print $2}')"
 if [[ "${CODE}" == "301" ]] && [[ "${LOC}" == *"/contact.html" ]]; then
-  c_pass "GET /old -> 301 Location ${LOC}"
+  c_pass "GET /old -> 301 Location ${LOC} (${TIME}s)"
 else
-  c_fail "_redirects rule -> got ${CODE}, Location=${LOC}"
+  c_fail "_redirects rule -> got ${CODE} in ${TIME}s, Location=${LOC}"
 fi
 
 # ---------------------------------------------------------------------------
@@ -108,17 +108,17 @@ scenario "2. Worker site (dynamic /api/hello + static /)"
 
 curl_get_worker "app.${PAGES_DOMAIN}" "/api/hello"
 if [[ "${CODE}" == "200" ]] && grep -q '"message":"hello from worker"' "${BODY}" && grep -q '"version":"v1"' "${BODY}"; then
-  c_pass "GET /api/hello -> 200 worker JSON v1 (cold start: pod create -> register -> lazy bundle load -> workerd)"
+  c_pass "GET /api/hello -> 200 worker JSON v1 in ${TIME}s (cold start: pod create -> register -> lazy bundle load -> workerd)"
 else
-  c_fail "GET /api/hello -> got ${CODE}, body: $(head -c200 "${BODY}")"
+  c_fail "GET /api/hello -> got ${CODE} in ${TIME}s, body: $(head -c200 "${BODY}")"
   dump_diagnostics
 fi
 
 curl_get "app.${PAGES_DOMAIN}" "/"
 if [[ "${CODE}" == "200" ]] && grep -q "DURUPAGES_WORKER_STATIC_INDEX_OK" "${BODY}"; then
-  c_pass "GET / (excluded by _routes.json) -> 200 static from router"
+  c_pass "GET / (excluded by _routes.json) -> 200 static from router (${TIME}s)"
 else
-  c_fail "GET / worker-site static -> got ${CODE}, body: $(head -c120 "${BODY}")"
+  c_fail "GET / worker-site static -> got ${CODE} in ${TIME}s, body: $(head -c120 "${BODY}")"
 fi
 
 # ---------------------------------------------------------------------------
@@ -150,9 +150,9 @@ for _ in $(seq 1 12); do
   sleep 2
 done
 if [[ "${V2_OK}" == "1" ]]; then
-  c_pass "GET /api/hello -> now returns v2 (workerd graceful swap)"
+  c_pass "GET /api/hello -> now returns v2 in ${TIME}s (workerd graceful swap)"
 else
-  c_fail "worker response did not change to v2; body: $(head -c200 "${BODY}")"
+  c_fail "worker response did not change to v2; last request ${TIME}s, body: $(head -c200 "${BODY}")"
 fi
 
 POD_AFTER="$(k3s_kubectl get pods -n "${WORKER_NS}" -l durupages.io/tenant-id=acme -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)"
