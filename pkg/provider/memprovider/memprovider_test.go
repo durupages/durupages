@@ -28,6 +28,12 @@ func TestConformance(t *testing.T) {
 	})
 }
 
+func TestAdminConformance(t *testing.T) {
+	providertest.RunAdminConformance(t, func(t *testing.T) provider.AdminProvider {
+		return memprovider.New(memprovider.Options{PagesDomain: providertest.PagesDomain})
+	})
+}
+
 func TestResolveStripsPort(t *testing.T) {
 	p := memprovider.New(memprovider.Options{PagesDomain: "pages.test"})
 	p.PutPage(provider.Page{ID: "blog", TenantID: "acme"})
@@ -68,7 +74,7 @@ func TestCustomDomainRemappedOnPut(t *testing.T) {
 func TestDeletePageDropsDomain(t *testing.T) {
 	p := memprovider.New(memprovider.Options{PagesDomain: "pages.test"})
 	p.PutPage(provider.Page{ID: "blog", TenantID: "acme", CustomDomains: []string{"www.example.com"}})
-	p.DeletePage("blog")
+	p.RemovePage("blog")
 
 	if _, err := p.ResolvePage(context.Background(), "www.example.com"); err != provider.ErrNotFound {
 		t.Fatalf("want ErrNotFound after delete, got %v", err)
@@ -107,9 +113,9 @@ func TestWatchReceivesEvents(t *testing.T) {
 
 	p.PutTenant(provider.Tenant{ID: "acme"})
 	p.PutPage(provider.Page{ID: "blog", TenantID: "acme"})
-	p.SetActiveDeployment("blog", "dep_2")
-	p.DeletePage("blog")
-	p.DeleteTenant("acme")
+	p.PutActiveDeployment("blog", "dep_2")
+	p.RemovePage("blog")
+	p.RemoveTenant("acme")
 
 	want := []provider.PageEventType{
 		provider.PageEventTenantChanged,

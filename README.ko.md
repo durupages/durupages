@@ -7,6 +7,7 @@
 Cloudflare 의 실제 JS 런타임인 [workerd](https://github.com/cloudflare/workerd) 를 그대로 사용하므로, **wrangler 로 빌드한 Pages 프로젝트를 수정 없이 그대로 배포**할 수 있습니다. 정적 자산 서빙과 SSR worker(Functions) 가 Cloudflare Pages 와 동일하게 동작합니다.
 
 - 아키텍처 상세: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+- CLI 레퍼런스: [docs/cli.md](docs/cli.md)
 
 ## 왜 DuruPages 인가
 
@@ -69,6 +70,77 @@ curl -H 'Host: app.pages.local' http://localhost:18080/api/hello
 
 배포 대상 디렉토리는 **Cloudflare Pages 에 올리는 빌드 산출물 그대로**입니다(`functions/` 를 쓴다면 `wrangler pages functions build` 로 먼저 컴파일하세요).
 
+## 페이지 배포하기
+
+`duru deploy` 에는 두 가지 모드가 있습니다. 하는 일(빌드 산출물 스캔 → 번들 업로드 → deployment 등록 → 활성화)은 같고, 클라이언트에 무엇이 필요한지가 다릅니다.
+
+### Admin API 모드 (권장)
+
+controller 의 admin API 를 켜면 클라이언트에 **DB·오브젝트 스토리지 자격증명이 전혀 필요 없습니다**. 빌드 산출물을 tar 로 스트리밍하면 나머지는 controller 가 처리합니다.
+
+```sh
+duru deploy --dir ./build-output --tenant acme --page blog \
+  --admin-url http://controller:9450
+```
+
+admin API 는 **별도 포트**로 뜨고 `DURUPAGES_ADMIN_ENABLED=true` 로 활성화합니다. 배포되는 기본 바이너리는 **인증 없이** 서비스하므로 반드시 사설망에 두세요(Kubernetes 에서는 ClusterIP 포트로만 열리며, `kubectl port-forward svc/<release>-controller 9450:9450` 로 접근하거나 앞단에 인증 프록시를 두세요). 프로세스 내에서 인증을 강제하려면 아래 미들웨어를 사용하세요.
+
+```sh
+helm upgrade durupages deploy/chart/durupages --reuse-values \
+  --set controller.adminApi.enabled=true
+```
+
+배포 외에 tenant/page 관리와 롤백도 지원합니다:
+
+```
+GET/POST        /v1/tenants          GET/DELETE /v1/tenants/{tenantId}
+GET/POST        /v1/pages            GET/DELETE /v1/pages/{pageId}
+PUT             /v1/pages/{pageId}/custom-domains
+GET/POST        /v1/pages/{pageId}/deployments          # POST = tar(.gz) 업로드
+POST            /v1/pages/{pageId}/deployments/{deploymentId}/activate   # 롤백
+```
+
+```sh
+# 이전 deployment 로 롤백
+curl -X POST http://controller:9450/v1/pages/blog/deployments/dep-123/activate
+```
+
+#### 인증 추가하기
+
+인증 방식은 조직마다 달라 특정 정책을 내장하지 않고 확장점으로 열어 두었습니다. `net/http` 미들웨어를 `adminapi.New` 에 넘기고 자체 controller 바이너리를 조립하면 됩니다(Storage/PageProvider/Queue/Scaler 인터페이스와 동일한 패턴).
+
+```go
+auth := func(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        if r.URL.Path == adminapi.HealthPath { // probe 는 자격증명을 제시할 수 없음
+            next.ServeHTTP(w, r)
+            return
+        }
+        if !valid(r.Header.Get("Authorization")) {
+            http.Error(w, "unauthorized", http.StatusUnauthorized)
+            return
+        }
+        next.ServeHTTP(w, r)
+    })
+}
+
+h, err := adminapi.New(adminapi.Options{
+    Provider: prov, Admin: prov, Storage: store,
+    Middleware: []func(http.Handler) http.Handler{auth},
+})
+```
+
+체인은 **바깥쪽부터** 실행되며 **모든 라우트가 감싸집니다** — 암묵적으로 면제되는 경로가 없으므로, 자격증명을 제시할 수 없는 health probe 는 위처럼 명시적으로 면제하세요. 요청 로깅은 체인 바깥에 있어 거부된 요청도 로그에 남습니다.
+
+### Direct 모드
+
+admin API 를 쓰지 않으면 CLI 가 Storage 와 PostgreSQL 에 직접 씁니다. 두 자격증명이 모두 필요합니다:
+
+```sh
+duru deploy --dir ./build-output --tenant acme --page blog \
+  --pg-dsn postgres://... --s3-bucket durupages
+```
+
 ## 배포
 
 Kubernetes 배포는 Helm Chart 를 사용합니다.
@@ -107,6 +179,7 @@ ghcr.io/<owner>/durupages-hub:<version>
 | `Queue` | in-memory | 테넌트별 대기열 (예: Redis 로 교체 가능) |
 | `Scaler` | target/max concurrency | worker Pod scale up/down 정책 |
 | `Runtime` | workerd | worker 실행 엔진 |
+| admin API `Middleware` | 없음 (인증 없음) | admin API 앞단의 인증·인가·감사 |
 
 ```go
 ctrl, err := controller.New(controller.Options{

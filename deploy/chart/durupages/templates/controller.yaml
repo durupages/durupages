@@ -24,6 +24,14 @@ spec:
       port: {{ .Values.controller.service.port }}
       targetPort: grpc
       protocol: TCP
+    {{- if .Values.controller.adminApi.enabled }}
+    # Admin API — UNAUTHENTICATED by design. It is exposed only as a ClusterIP
+    # port; do not add an Ingress/LoadBalancer for it without your own auth.
+    - name: admin
+      port: {{ .Values.controller.adminApi.service.port }}
+      targetPort: admin
+      protocol: TCP
+    {{- end }}
   selector:
     {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "controller") | nindent 4 }}
 ---
@@ -106,10 +114,28 @@ spec:
                 secretKeyRef:
                   name: {{ include "durupages.postgresSecretName" . }}
                   key: {{ include "durupages.postgresSecretKey" . }}
+            {{- if .Values.controller.adminApi.enabled }}
+            # Admin API: unauthenticated management + deployment upload. It is
+            # the only part of the controller that touches Storage.
+            - name: DURUPAGES_ADMIN_ENABLED
+              value: "true"
+            - name: DURUPAGES_ADMIN_LISTEN
+              value: ":{{ .Values.controller.adminApi.service.port }}"
+            {{- with .Values.controller.adminApi.maxUploadBytes }}
+            - name: DURUPAGES_ADMIN_MAX_UPLOAD_BYTES
+              value: {{ . | quote }}
+            {{- end }}
+            {{- include "durupages.s3Env" . | nindent 12 }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.controller.service.port }}
               protocol: TCP
+            {{- if .Values.controller.adminApi.enabled }}
+            - name: admin
+              containerPort: {{ .Values.controller.adminApi.service.port }}
+              protocol: TCP
+            {{- end }}
           {{- with .Values.controller.resources }}
           resources:
             {{- toYaml . | nindent 12 }}

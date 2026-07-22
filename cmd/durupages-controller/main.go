@@ -4,6 +4,10 @@
 // Command durupages-controller runs the control plane. Default assembly:
 // PostgreSQL PageProvider + in-memory Queue + default Scaler + Kubernetes
 // PodManager.
+//
+// It optionally exposes the admin API (tenant/page/deployment management and
+// deployment upload) on a SEPARATE port, enabled with DURUPAGES_ADMIN_ENABLED.
+// That API is unauthenticated by design — bind it to a private network.
 package main
 
 import (
@@ -12,8 +16,10 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -23,10 +29,14 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/durupages/durupages/internal/version"
+	"github.com/durupages/durupages/pkg/adminapi"
 	"github.com/durupages/durupages/pkg/controller"
+	"github.com/durupages/durupages/pkg/provider"
 	"github.com/durupages/durupages/pkg/provider/postgres"
 	"github.com/durupages/durupages/pkg/queue/inmemory"
 	"github.com/durupages/durupages/pkg/scaler/defaultscaler"
+	"github.com/durupages/durupages/pkg/storage"
+	"github.com/durupages/durupages/pkg/storage/s3"
 	"github.com/durupages/durupages/pkg/workerauth"
 )
 
@@ -35,6 +45,45 @@ func envOr(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func envOrInt64(key string, def int64) int64 {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+// config is the resolved controller configuration.
+type config struct {
+	listen        string
+	pgDSN         string
+	pagesDomain   string
+	migrate       bool
+	signingKeyPEM string
+
+	controllerAddr string
+	hubAddr        string
+	hubLogAddr     string
+
+	kubeconfig      string
+	workerNamespace string
+	workerImage     string
+	workerSA        string
+	workerCPULimit  string
+	workerMemLimit  string
+
+	defaults       controller.Defaults
+	bundleMinIdle  string
+	bundleCacheMax string
+
+	// Admin API (optional, separate port, unauthenticated).
+	adminEnabled   bool
+	adminListen    string
+	adminMaxUpload int64
+	s3             s3.Options
 }
 
 func main() {
@@ -67,32 +116,51 @@ func main() {
 
 		bundleMinIdle  = flag.String("worker-bundle-min-idle", envOr("DURUPAGES_BUNDLE_MIN_IDLE", ""), "worker bundle LRU min idle (propagated)")
 		bundleCacheMax = flag.String("worker-bundle-cache-max-bytes", envOr("DURUPAGES_BUNDLE_CACHE_MAX_BYTES", ""), "worker bundle cache limit (propagated)")
+
+		adminEnabled   = flag.Bool("admin-enabled", envOr("DURUPAGES_ADMIN_ENABLED", "false") == "true", "enable the unauthenticated admin API on --admin-listen")
+		adminListen    = flag.String("admin-listen", envOr("DURUPAGES_ADMIN_LISTEN", ":9450"), "admin API listen address (separate port)")
+		adminMaxUpload = flag.Int64("admin-max-upload-bytes", envOrInt64("DURUPAGES_ADMIN_MAX_UPLOAD_BYTES", 512<<20), "admin API deployment upload size limit")
+
+		s3Endpoint  = flag.String("s3-endpoint", envOr("DURUPAGES_S3_ENDPOINT", ""), "S3 endpoint (admin API uploads)")
+		s3Region    = flag.String("s3-region", envOr("DURUPAGES_S3_REGION", "us-east-1"), "S3 region (admin API uploads)")
+		s3Bucket    = flag.String("s3-bucket", envOr("DURUPAGES_S3_BUCKET", ""), "S3 bucket (required when the admin API is enabled)")
+		s3AccessKey = flag.String("s3-access-key", envOr("DURUPAGES_S3_ACCESS_KEY", ""), "S3 access key (admin API uploads)")
+		s3SecretKey = flag.String("s3-secret-key", envOr("DURUPAGES_S3_SECRET_KEY", ""), "S3 secret key (admin API uploads)")
+		s3PathStyle = flag.Bool("s3-path-style", envOr("DURUPAGES_S3_PATH_STYLE", "true") == "true", "path-style S3 addressing (admin API uploads)")
 	)
 	flag.Parse()
-	if err := run(*listen, *pgDSN, *pagesDomain, *migrate, *signingKeyPEM, *controllerAddr, *hubAddr, *hubLogAddr,
-		*kubeconfig, *workerNamespace, *workerImage, *workerSA, *workerCPULimit, *workerMemLimit,
-		controller.Defaults{
+
+	cfg := config{
+		listen: *listen, pgDSN: *pgDSN, pagesDomain: *pagesDomain, migrate: *migrate,
+		signingKeyPEM:  *signingKeyPEM,
+		controllerAddr: *controllerAddr, hubAddr: *hubAddr, hubLogAddr: *hubLogAddr,
+		kubeconfig: *kubeconfig, workerNamespace: *workerNamespace, workerImage: *workerImage,
+		workerSA: *workerSA, workerCPULimit: *workerCPULimit, workerMemLimit: *workerMemLimit,
+		defaults: controller.Defaults{
 			QueueTimeout: *defQueueTimeout, MaxQueueTimeout: *maxQueueTimeout,
 			RequestTimeout: *defRequestTimeout, MaxConcurrency: *defMaxConcurrency,
 			MaxConcurrencyPerPod: *maxConcPerPod, TargetConcurrencyPerPod: *targetConcPerPod,
 			IdleTTL: *defIdleTTL,
-		}, *bundleMinIdle, *bundleCacheMax); err != nil {
+		},
+		bundleMinIdle: *bundleMinIdle, bundleCacheMax: *bundleCacheMax,
+		adminEnabled: *adminEnabled, adminListen: *adminListen, adminMaxUpload: *adminMaxUpload,
+		s3: s3.Options{Endpoint: *s3Endpoint, Region: *s3Region, Bucket: *s3Bucket,
+			AccessKey: *s3AccessKey, SecretKey: *s3SecretKey, UsePathStyle: *s3PathStyle},
+	}
+	if err := run(cfg); err != nil {
 		log.Fatalf("durupages-controller: %v", err)
 	}
 }
 
-func run(listen, pgDSN, pagesDomain string, migrate bool, signingKeyPEM, controllerAddr, hubAddr, hubLogAddr,
-	kubeconfig, workerNamespace, workerImage, workerSA, cpuLimit, memLimit string,
-	defaults controller.Defaults, bundleMinIdle, bundleCacheMax string) error {
-
-	if pgDSN == "" || signingKeyPEM == "" || controllerAddr == "" || hubAddr == "" || workerImage == "" {
+func run(cfg config) error {
+	if cfg.pgDSN == "" || cfg.signingKeyPEM == "" || cfg.controllerAddr == "" || cfg.hubAddr == "" || cfg.workerImage == "" {
 		return fmt.Errorf("--pg-dsn, --worker-jwt-signing-key, --controller-addr, --hub-addr and --worker-image are required")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	keyData, err := os.ReadFile(signingKeyPEM)
+	keyData, err := os.ReadFile(cfg.signingKeyPEM)
 	if err != nil {
 		return fmt.Errorf("read signing key: %w", err)
 	}
@@ -101,20 +169,20 @@ func run(listen, pgDSN, pagesDomain string, migrate bool, signingKeyPEM, control
 		return fmt.Errorf("parse signing key: %w", err)
 	}
 
-	prov, err := postgres.New(ctx, postgres.Options{DSN: pgDSN, PagesDomain: pagesDomain})
+	prov, err := postgres.New(ctx, postgres.Options{DSN: cfg.pgDSN, PagesDomain: cfg.pagesDomain})
 	if err != nil {
 		return fmt.Errorf("postgres: %w", err)
 	}
 	defer prov.Close()
-	if migrate {
+	if cfg.migrate {
 		if err := prov.Migrate(ctx); err != nil {
 			return fmt.Errorf("migrate: %w", err)
 		}
 	}
 
 	var restCfg *rest.Config
-	if kubeconfig != "" {
-		restCfg, err = clientcmd.BuildConfigFromFlags("", kubeconfig)
+	if cfg.kubeconfig != "" {
+		restCfg, err = clientcmd.BuildConfigFromFlags("", cfg.kubeconfig)
 	} else {
 		restCfg, err = rest.InClusterConfig()
 	}
@@ -127,12 +195,12 @@ func run(listen, pgDSN, pagesDomain string, migrate bool, signingKeyPEM, control
 	}
 	pods, err := controller.NewKubePods(controller.KubePodsOptions{
 		Client:             clientset,
-		Namespace:          workerNamespace,
-		Image:              workerImage,
-		ServiceAccountName: workerSA,
+		Namespace:          cfg.workerNamespace,
+		Image:              cfg.workerImage,
+		ServiceAccountName: cfg.workerSA,
 		Generation:         fmt.Sprintf("g%d", time.Now().Unix()),
-		DefaultCPULimit:    cpuLimit,
-		DefaultMemLimit:    memLimit,
+		DefaultCPULimit:    cfg.workerCPULimit,
+		DefaultMemLimit:    cfg.workerMemLimit,
 	})
 	if err != nil {
 		return fmt.Errorf("kubepods: %w", err)
@@ -144,12 +212,12 @@ func run(listen, pgDSN, pagesDomain string, migrate bool, signingKeyPEM, control
 		Scaler:              defaultscaler.New(),
 		Pods:                pods,
 		SigningKey:          priv,
-		Defaults:            defaults,
-		ControllerAddr:      controllerAddr,
-		HubAddr:             hubAddr,
-		HubLogAddr:          hubLogAddr,
-		BundleMinIdle:       bundleMinIdle,
-		BundleCacheMaxBytes: bundleCacheMax,
+		Defaults:            cfg.defaults,
+		ControllerAddr:      cfg.controllerAddr,
+		HubAddr:             cfg.hubAddr,
+		HubLogAddr:          cfg.hubLogAddr,
+		BundleMinIdle:       cfg.bundleMinIdle,
+		BundleCacheMaxBytes: cfg.bundleCacheMax,
 	})
 	if err != nil {
 		return fmt.Errorf("controller: %w", err)
@@ -158,20 +226,67 @@ func run(listen, pgDSN, pagesDomain string, migrate bool, signingKeyPEM, control
 	grpcSrv := grpc.NewServer()
 	ctrl.RegisterServices(grpcSrv)
 
-	lis, err := net.Listen("tcp", listen)
+	lis, err := net.Listen("tcp", cfg.listen)
 	if err != nil {
 		return err
 	}
-	errc := make(chan error, 2)
+	errc := make(chan error, 3)
 	go func() { errc <- grpcSrv.Serve(lis) }()
 	go func() { errc <- ctrl.Run(ctx) }()
-	log.Printf("controller listening on %s", listen)
+	log.Printf("controller listening on %s", cfg.listen)
+
+	adminSrv, err := startAdminAPI(ctx, cfg, prov, errc)
+	if err != nil {
+		return err
+	}
 
 	select {
 	case <-ctx.Done():
 		grpcSrv.GracefulStop()
+		if adminSrv != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			_ = adminSrv.Shutdown(shutdownCtx)
+		}
 		return nil
 	case err := <-errc:
 		return err
 	}
+}
+
+// startAdminAPI serves the admin API on its own port when enabled. It returns
+// nil when the API is disabled. Storage is only required here: the control
+// plane itself never touches Storage.
+func startAdminAPI(ctx context.Context, cfg config, prov *postgres.Provider, errc chan<- error) (*http.Server, error) {
+	if !cfg.adminEnabled {
+		return nil, nil
+	}
+	if cfg.s3.Bucket == "" {
+		return nil, fmt.Errorf("--s3-bucket is required when the admin API is enabled")
+	}
+	var store storage.Storage
+	store, err := s3.New(ctx, cfg.s3)
+	if err != nil {
+		return nil, fmt.Errorf("admin api s3: %w", err)
+	}
+
+	var admin provider.AdminProvider = prov
+	h, err := adminapi.New(adminapi.Options{
+		Provider:       prov,
+		Admin:          admin,
+		Storage:        store,
+		MaxUploadBytes: cfg.adminMaxUpload,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("admin api: %w", err)
+	}
+
+	srv := &http.Server{Addr: cfg.adminListen, Handler: h}
+	go func() {
+		log.Printf("admin API listening on %s (UNAUTHENTICATED — keep this port private)", cfg.adminListen)
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errc <- err
+		}
+	}()
+	return srv, nil
 }

@@ -2,13 +2,15 @@
 // SPDX-License-Identifier: EPL-2.0
 
 // Package memprovider is a thread-safe, in-memory PageProvider intended for
-// tests and local development. It implements provider.PageProvider and the
-// optional provider.PageWatcher extension, plus mutation helpers used to drive
-// fixtures. It is not durable: all state lives in memory.
+// tests and local development. It implements provider.PageProvider, the
+// optional provider.PageWatcher extension and provider.AdminProvider (see
+// admin.go), plus non-context mutation helpers used to drive fixtures. It is
+// not durable: all state lives in memory.
 package memprovider
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"sync"
 
@@ -31,11 +33,12 @@ type Options struct {
 type Provider struct {
 	pagesDomain string
 
-	mu       sync.RWMutex
-	tenants  map[string]provider.Tenant
-	pages    map[string]provider.Page
-	byDomain map[string]string // lowercased custom domain -> pageID
-	watchers []chan provider.PageEvent
+	mu          sync.RWMutex
+	tenants     map[string]provider.Tenant
+	pages       map[string]provider.Page
+	byDomain    map[string]string                // lowercased custom domain -> pageID
+	deployments map[string][]provider.Deployment // pageID -> deployments
+	watchers    []chan provider.PageEvent
 }
 
 // compile-time interface checks.
@@ -51,6 +54,7 @@ func New(opts Options) *Provider {
 		tenants:     make(map[string]provider.Tenant),
 		pages:       make(map[string]provider.Page),
 		byDomain:    make(map[string]string),
+		deployments: make(map[string][]provider.Deployment),
 	}
 }
 
@@ -134,57 +138,38 @@ func (p *Provider) PutTenant(t provider.Tenant) {
 	p.emit(provider.PageEvent{Type: provider.PageEventTenantChanged, TenantID: t.ID})
 }
 
-// DeleteTenant removes a tenant and emits a tenant-deleted event. Pages owned
-// by the tenant are not touched.
-func (p *Provider) DeleteTenant(tenantID string) {
-	p.mu.Lock()
-	_, existed := p.tenants[tenantID]
-	delete(p.tenants, tenantID)
-	p.mu.Unlock()
-	if existed {
-		p.emit(provider.PageEvent{Type: provider.PageEventTenantDeleted, TenantID: tenantID})
-	}
+// RemoveTenant is the non-context spelling of DeleteTenant, kept for fixture
+// code. Like DeleteTenant it also removes the tenant's pages.
+func (p *Provider) RemoveTenant(tenantID string) {
+	_ = p.DeleteTenant(context.Background(), tenantID)
 }
 
-// PutPage inserts or replaces a page. The custom-domain index is rebuilt from
-// the page's CustomDomains, and a page-changed event is emitted.
+// PutPage inserts or replaces a page together with its custom domains: the
+// domain index is rebuilt from the page's CustomDomains, and a page-changed
+// event is emitted. This differs from UpsertPage, which leaves the domain set
+// alone (see admin.go).
 func (p *Provider) PutPage(pg provider.Page) {
 	p.mu.Lock()
 	p.removeDomainsLocked(pg.ID)
-	p.pages[pg.ID] = *clonePage(pg)
-	for _, d := range pg.CustomDomains {
-		p.byDomain[strings.ToLower(strings.TrimSpace(d))] = pg.ID
+	stored := *clonePage(pg)
+	stored.CustomDomains = normalizeDomains(pg.CustomDomains)
+	p.pages[pg.ID] = stored
+	for _, d := range stored.CustomDomains {
+		p.byDomain[d] = pg.ID
 	}
 	p.mu.Unlock()
 	p.emit(provider.PageEvent{Type: provider.PageEventPageChanged, TenantID: pg.TenantID, PageID: pg.ID})
 }
 
-// DeletePage removes a page and its custom-domain mappings, emitting a
-// page-deleted event.
-func (p *Provider) DeletePage(pageID string) {
-	p.mu.Lock()
-	pg, existed := p.pages[pageID]
-	p.removeDomainsLocked(pageID)
-	delete(p.pages, pageID)
-	p.mu.Unlock()
-	if existed {
-		p.emit(provider.PageEvent{Type: provider.PageEventPageDeleted, TenantID: pg.TenantID, PageID: pageID})
-	}
+// RemovePage is the non-context spelling of DeletePage, kept for fixture code.
+func (p *Provider) RemovePage(pageID string) {
+	_ = p.DeletePage(context.Background(), pageID)
 }
 
-// SetActiveDeployment points a page at a new active deployment and emits a
-// page-changed event. It is a no-op if the page does not exist.
-func (p *Provider) SetActiveDeployment(pageID, deploymentID string) {
-	p.mu.Lock()
-	pg, ok := p.pages[pageID]
-	if ok {
-		pg.ActiveDeploymentID = deploymentID
-		p.pages[pageID] = pg
-	}
-	p.mu.Unlock()
-	if ok {
-		p.emit(provider.PageEvent{Type: provider.PageEventPageChanged, TenantID: pg.TenantID, PageID: pageID})
-	}
+// PutActiveDeployment is the non-context spelling of SetActiveDeployment, kept
+// for fixture code. It is a no-op if the page does not exist.
+func (p *Provider) PutActiveDeployment(pageID, deploymentID string) {
+	_ = p.SetActiveDeployment(context.Background(), pageID, deploymentID)
 }
 
 // removeDomainsLocked drops all custom-domain mappings that point at pageID.
@@ -195,6 +180,38 @@ func (p *Provider) removeDomainsLocked(pageID string) {
 			delete(p.byDomain, d)
 		}
 	}
+}
+
+// deletePageLocked removes a page along with its custom domains and
+// deployments, reporting whether it existed. The caller must hold p.mu for
+// writing and is responsible for emitting the page-deleted event.
+func (p *Provider) deletePageLocked(pageID string) (provider.Page, bool) {
+	pg, existed := p.pages[pageID]
+	p.removeDomainsLocked(pageID)
+	delete(p.pages, pageID)
+	delete(p.deployments, pageID)
+	return pg, existed
+}
+
+// normalizeDomains lowercases and trims domains, drops empties and duplicates
+// and sorts the result, mirroring how the PostgreSQL provider stores and
+// returns custom domains. An empty input yields nil.
+func normalizeDomains(domains []string) []string {
+	var out []string
+	seen := make(map[string]struct{}, len(domains))
+	for _, d := range domains {
+		d = strings.ToLower(strings.TrimSpace(d))
+		if d == "" {
+			continue
+		}
+		if _, dup := seen[d]; dup {
+			continue
+		}
+		seen[d] = struct{}{}
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // emit broadcasts an event to every watcher without blocking.

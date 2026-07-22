@@ -145,6 +145,22 @@ controller:
   pagesDomain: pages.local
   # -- Apply PostgreSQL schema migrations on start.
   migrate: true
+  # Admin API: tenant/page management and deployment upload over HTTP, served
+  # on a separate port so `duru deploy --admin-url` needs no database or object
+  # storage credentials.
+  #
+  # It is UNAUTHENTICATED by design. Enabling it only opens a ClusterIP port —
+  # reach it with `kubectl port-forward svc/<release>-controller 9450:9450`, or
+  # put your own authenticating proxy in front. Do not expose it publicly.
+  #
+  # Requires s3.* to be configured: uploads are written to Storage by the
+  # controller (this is the only part of the control plane that touches it).
+  adminApi:
+    enabled: false
+    service:
+      port: 9450
+    # -- Deployment upload body limit in bytes ("" = binary default, 512 MiB).
+    maxUploadBytes: ""
   # timeouts / concurrency (no env equivalents -- passed as flags)
   defaultQueueTimeout: 30s
   maxQueueTimeout: 120s

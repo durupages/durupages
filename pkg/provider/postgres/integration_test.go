@@ -77,6 +77,15 @@ func TestPostgresConformance(t *testing.T) {
 	})
 }
 
+func TestPostgresAdminConformance(t *testing.T) {
+	// Establish (and skip on absence) once, then reuse the pool per sub-test.
+	p := newTestProvider(t)
+	providertest.RunAdminConformance(t, func(t *testing.T) provider.AdminProvider {
+		truncate(t, p)
+		return p
+	})
+}
+
 func TestPostgresWriteHelpers(t *testing.T) {
 	p := newTestProvider(t)
 	truncate(t, p)

@@ -59,7 +59,7 @@ flowchart LR
 
 | 구성요소 | replicas | 역할 |
 |---|---|---|
-| durupages-controller | 1 | Control plane. 요청 queue, worker pod 생명주기 관리, autoscaling(Scaler 인터페이스 — 4.4), reconcile |
+| durupages-controller | 1 | Control plane. 요청 queue, worker pod 생명주기 관리, autoscaling(Scaler 인터페이스 — 4.4), reconcile. 선택적으로 **admin API**(별도 포트, 14장) 제공 |
 | durupages-router | >= 1 | Data plane 입구. host → page/tenant 라우팅, static resource 직접 서빙(LRU 캐시), `_redirects`/`_headers` 적용, dynamic 요청 proxy |
 | durupages-hub | >= 1 | **worker 지원 서비스** (필수). ① worker pod 에 대한 **tenant-scoped 번들 배포** — Storage 자격증명은 hub 만 보유하고, pod 는 자기 tenant 의 번들만 받을 수 있음 (디스크 캐시로 cold start 가속) ② request 별 사용량·로그·예외 수집 (9장. 로깅 파이프라인은 선택 — 비활성 시 shim 이 pod log 로만 출력) |
 | durupages-worker | **tenant 별** 0..N | 짧은 주기의 임시 Pod (단일 컨테이너: shim + durupages-workerd). **해당 tenant 의 page worker 들을 lazy loading 으로 실행.** 다른 tenant 로 재사용 금지 |
@@ -354,8 +354,10 @@ type ObjectInfo struct {
 
 - 기본 구현: S3 (AWS SDK, MinIO 호환).
 - **Storage 에 접근하는 곳은 router / hub / 배포 CLI(duru) 뿐이며, 모두 이 interface 를 통해서만
-  접근**합니다. controller 는 Storage 를 다루지 않고, worker pod 는 hub 를 경유합니다 (자격증명 미보유).
+  접근**합니다. worker pod 는 hub 를 경유합니다 (자격증명 미보유).
   커스텀 Storage 는 각 바이너리에 자신의 구현을 링크해 조립합니다.
+- 예외: controller 는 **admin API 를 활성화한 경우에만** Storage 를 사용합니다 (업로드된 배포를
+  기록하기 위해). control plane 경로(queue/lease/scaling)는 Storage 를 전혀 건드리지 않습니다 (14장).
 
 ### 4.2 PageProvider
 
@@ -1068,6 +1070,10 @@ type LogSink interface {
 | hub 주소 (shim 에 전파) | `--hub-addr` | - |
 | hub 로그 주소 (설정 시 로깅 활성화, worker 로 전파) | `--hub-log-addr` | - (미설정 = pod log 모드) |
 | worker JWT 서명 개인키 (Ed25519) | `--worker-jwt-signing-key` (hub 는 대응 공개키로 검증) | - |
+| admin API 활성화 (별도 포트, 14장) | `--admin-enabled` / `DURUPAGES_ADMIN_ENABLED` | false |
+| admin API listen 주소 | `--admin-listen` / `DURUPAGES_ADMIN_LISTEN` | `:9450` |
+| admin API 업로드 크기 상한 | `--admin-max-upload-bytes` | 512MiB |
+| Storage (S3) — **admin API 활성화 시에만 필요** | `--s3-endpoint/bucket/...` | - |
 | PageProvider DSN | `--pg-dsn` | - |
 
 ### router 주요 설정
@@ -1126,6 +1132,7 @@ durupages/
 │   ├── controller/               # 라이브러리로 공개 (커스텀 controller 조립용)
 │   │   ├── dispatcher/           # slot / lease 관리, queue ↔ slot 연결 (tenant 단위, page 로드 인지 배정)
 │   │   └── reconciler/           # pod reconcile / GC
+│   ├── adminapi/                 # admin API (별도 포트, 인증 없음 — 14장)
 │   ├── scaler/                   # Scaler 인터페이스 (4.4)
 │   │   └── defaultscaler/        # 기본 구현 (6.4 알고리즘)
 │   ├── runtime/                  # Runtime 인터페이스 (4.5) — runtime 교체 지점
@@ -1220,6 +1227,96 @@ services:
 11. **커스텀 workerd 임베더(durupages-workerd) 필수** — 공식 workerd 바이너리는 `NullIsolateLimitEnforcer`/no-op `LimitEnforcer` 로 리소스 제한이 없고 tail trace 의 cpuTime/wallTime 도 0 하드코딩임을 소스 분석과 로컬 실측으로 확인했습니다 (6.6). 계측·제한을 cgroup 등 OS 계층이 아닌 workerd(V8) 수준에서 수행하기 위해 `IsolateLimitEnforcer`·`LimitEnforcer`·`RequestObserver` 를 실구현한 자체 임베더를 빌드합니다. 유지비용(workerd 버전 추적)은 인터페이스 구현체 주입으로 patch 면적을 최소화해 관리합니다.
 12. **memory 는 request 단위로 계측하지 않음** — V8 isolate 특성상 GC/힙 공유 때문에 요청별 메모리 귀속이 무의미에 가깝고, workerd 도 이를 제공하지 않습니다. 메모리는 isolate heap limit(6.6)과 pod resources limit 로 제한만 하며 과금 계측 대상에서 제외합니다.
 13. **scale 판단을 Scaler 인터페이스로 분리** — scale-up/down 정책(4.4)을 Queue/Storage/PageProvider 와 같은 급의 교체 지점으로 두어, 기본 알고리즘(6.4) 외에 예측 기반·시간대 기반 등 운영자 정책을 조립할 수 있습니다. 호출 시점(요청 시 scale-up, 주기 scale-down)과 `MaxConcurrency` clamp 는 controller 가 강제하므로 커스텀 구현이 안전 한도를 벗어날 수 없습니다.
+14. **admin API 는 선택 기능이며 별도 포트 + 인증 없음** — 배포 편의(클라이언트에 DB/S3 자격증명 불필요)를 위해 controller 에 붙이되, gRPC control plane 포트와 분리하고 기본 비활성으로 두었습니다 (14장). 인증을 내장하지 않는 대신 "사설망 전용" 을 계약으로 명시합니다 — 운영자가 앞단에 인증 프록시를 두거나 port-forward 로만 접근하는 것을 전제합니다. 기존 direct 모드(`duru deploy --pg-dsn --s3-*`)는 admin API 없이도 배포할 수 있도록 그대로 유지합니다.
+
+---
+
+## 14. Admin API (선택)
+
+배포를 위해 클라이언트가 PostgreSQL DSN 과 S3 자격증명을 들고 있어야 하는 불편을 없애는
+관리용 HTTP API 입니다. controller 가 **별도 포트**로 제공하며 **기본 비활성**입니다.
+
+- 활성화: `DURUPAGES_ADMIN_ENABLED=true` (+ `DURUPAGES_ADMIN_LISTEN`, 기본 `:9450`).
+  Helm 은 `controller.adminApi.enabled=true`.
+- **기본 배포 바이너리에는 인증이 없습니다 (의도된 설계).** 사설망 전용이며, chart 는 ClusterIP
+  포트로만 노출합니다. 외부 노출이 필요하면 앞단에 인증 프록시를 두거나, 아래 미들웨어로 직접
+  인증을 구현해야 합니다.
+- 활성화 시에만 controller 가 Storage 를 사용합니다 (업로드 저장). control plane 경로는 무관.
+
+**인증: `Middleware` 확장점**
+
+인증 방식은 조직마다 다르므로(bearer token, mTLS, OIDC, 내부 SSO 헤더, tenant 별 인가 …) 특정 정책을
+내장하는 대신 `adminapi.Options.Middleware` 로 주입하게 했습니다 — Storage/PageProvider/Queue/Scaler 와
+같은 급의 교체 지점입니다. 커스텀 인증을 쓰려면 이 패키지를 감싸는 자체 바이너리를 조립합니다.
+
+```go
+h, _ := adminapi.New(adminapi.Options{
+    Provider: prov, Admin: prov, Storage: store,
+    Middleware: []func(http.Handler) http.Handler{authMiddleware, auditMiddleware},
+})
+```
+
+- 체인은 **바깥쪽부터** 실행됩니다 (`Middleware[0]` 이 가장 바깥).
+- **모든 라우트가 감싸집니다** — `adminapi.HealthPath`(`/healthz`) 도 예외가 아닙니다. 인증 확장이
+  의도치 않은 구멍을 남기지 않도록 한 선택이며, 자격증명을 제시할 수 없는 probe 는 미들웨어에서
+  `r.URL.Path == adminapi.HealthPath` 로 명시적으로 면제합니다.
+- 요청 로깅이 미들웨어보다 바깥이므로, 미들웨어가 거부한 요청도 그 status 로 로그에 남습니다.
+- `nil` 미들웨어나 `nil` 을 반환하는 미들웨어는 `New` 가 오류로 거부합니다(첫 요청에서 panic 하는 대신).
+
+**엔드포인트**
+
+```
+GET    /healthz
+GET|POST        /v1/tenants                 GET|DELETE /v1/tenants/{tenantId}
+GET             /v1/tenants/{tenantId}/pages
+GET|POST        /v1/pages                   GET|DELETE /v1/pages/{pageId}
+PUT             /v1/pages/{pageId}/custom-domains
+GET|PUT|PATCH   /v1/pages/{pageId}/secrets              PUT|DELETE /v1/pages/{pageId}/secrets/{name}
+GET|POST        /v1/pages/{pageId}/deployments
+POST            /v1/pages/{pageId}/deployments/{deploymentId}/activate
+```
+
+**배포 업로드** — `POST /v1/pages/{pageId}/deployments?deploymentId=&activate=`
+
+1. 요청 본문은 빌드 산출물의 tar 또는 tar.gz (gzip 매직바이트로 자동 판별).
+2. 임시 디렉토리에 안전 해제 — 절대경로/`..`/심링크/하드링크 거부, 업로드·해제 크기 상한(413).
+   최상위 디렉토리가 하나뿐이면 그것을 빌드 루트로 간주합니다.
+3. `bundle.Scan` → `bundle.Upload`(Storage) → `CreateDeployment` → (`activate=true` 기본) `SetActiveDeployment`.
+4. tenantId 는 **저장된 page 에서만** 취하며 클라이언트 값을 신뢰하지 않습니다.
+
+**설계 메모**
+
+- 쓰기 연산은 `provider.AdminProvider`(4.2 의 선택적 확장)를 통해 수행합니다. 이를 구현하지 않는
+  커스텀 PageProvider 면 해당 라우트는 501 을 반환합니다.
+- `UpsertPage` 는 custom domain 을 다루지 않는다는 provider 계약 때문에, page 생성/수정 시 도메인이
+  명시되면 `SetCustomDomains` 를 별도 호출합니다 (그렇지 않으면 조용히 유실됨 — 회귀 테스트로 고정).
+- 응답은 **Secret 값을 절대 반환하지 않고** 키 이름만 노출합니다(`config.secretKeys`).
+- `duru deploy --admin-url` 이 이 API 를 사용하며, 기존 direct 모드는 그대로 유지됩니다.
+
+**Secret 하위 리소스** — 값이 클라이언트로 나가지 않는 대신 **서버가 대신 편집**합니다
+
+`POST /v1/pages` 의 `config.secret` 은 맵 전체 교체만 가능합니다 — 클라이언트는 기존 값을 볼 수 없어
+보존할 방법이 없기 때문입니다. 반면 서버는 `GetPage` 로 값을 읽을 수 있으므로, 단일 키 조작은
+서버에서 read-modify-write 로 처리합니다 (wrangler 의 `secret put`/`secret delete` 와 동일한 UX).
+
+| 라우트 | 동작 |
+|---|---|
+| `GET /v1/pages/{pageId}/secrets` | 키 이름 목록(`{"secretKeys":[...]}`). 값은 어떤 응답에도 없음 |
+| `PUT /v1/pages/{pageId}/secrets/{name}` | 단일 upsert (`{"value":"..."}`) |
+| `DELETE /v1/pages/{pageId}/secrets/{name}` | 단일 삭제 (없는 키도 200 — 멱등) |
+| `PATCH /v1/pages/{pageId}/secrets` | **여러 개 upsert** (`{"secrets":{...}}`). 언급하지 않은 키는 보존, `null` 값은 해당 키 삭제 |
+| `PUT /v1/pages/{pageId}/secrets` | 전체 교체 (`{"secrets":{...}}`). `{}` 는 전체 삭제 |
+
+PATCH/PUT 모두 최대 100개(wrangler 상한과 동일)입니다. 두 메서드를 나눈 이유는
+"이 파일을 적용해줘"(upsert)와 "이제 이게 내 secret 전부야"(교체)가 서로 다른 의도이고,
+어느 쪽인지는 클라이언트만 알기 때문입니다.
+
+- 이름은 worker binding 식별자 규칙(`^[A-Za-z_][A-Za-z0-9_]*$`, ≤256자)로 검증합니다.
+- 값을 반환하는 라우트(`GET .../secrets/{name}`)는 **의도적으로 없습니다**.
+- read-modify-write 는 원자적이지 않지만 controller 가 단일 replica 라 허용 가능합니다.
+- CLI 는 `duru --page <id> secret put|delete|list|bulk` (bulk 는 기본 upsert, `--replace` 로 교체),
+  배포 시 전체 교체는 `duru deploy --secrets-file`
+  (JSON 또는 `.env`) 입니다 — [docs/cli.md](cli.md) 참조.
 
 ---
 

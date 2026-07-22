@@ -93,16 +93,43 @@ func (p *Provider) ResolvePage(ctx context.Context, host string) (*provider.Page
 	return p.GetPage(ctx, label)
 }
 
-// GetPage returns the page with the given ID, or provider.ErrNotFound.
-func (p *Provider) GetPage(ctx context.Context, pageID string) (*provider.Page, error) {
+// pageColumns is the column list every pages query selects, in the order
+// scanPage expects.
+const pageColumns = `id, tenant_id, active_deployment_id, config`
+
+// rowScanner is the scanning behaviour shared by pgx.Row and pgx.Rows, so one
+// helper can decode both single-row and multi-row queries.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanPage decodes a single pages row selected with pageColumns. CustomDomains
+// is left nil; callers fill it in from the custom_domains table.
+func scanPage(s rowScanner) (provider.Page, error) {
 	var (
+		id         string
 		tenantID   string
 		activeDep  *string
 		configJSON []byte
 	)
-	err := p.pool.QueryRow(ctx,
-		`SELECT tenant_id, active_deployment_id, config FROM pages WHERE id = $1`, pageID).
-		Scan(&tenantID, &activeDep, &configJSON)
+	if err := s.Scan(&id, &tenantID, &activeDep, &configJSON); err != nil {
+		return provider.Page{}, err
+	}
+	cfg, err := decodePageConfig(configJSON)
+	if err != nil {
+		return provider.Page{}, err
+	}
+	pg := provider.Page{ID: id, TenantID: tenantID, Config: cfg}
+	if activeDep != nil {
+		pg.ActiveDeploymentID = *activeDep
+	}
+	return pg, nil
+}
+
+// GetPage returns the page with the given ID, or provider.ErrNotFound.
+func (p *Provider) GetPage(ctx context.Context, pageID string) (*provider.Page, error) {
+	pg, err := scanPage(p.pool.QueryRow(ctx,
+		`SELECT `+pageColumns+` FROM pages WHERE id = $1`, pageID))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, provider.ErrNotFound
 	}
@@ -110,25 +137,12 @@ func (p *Provider) GetPage(ctx context.Context, pageID string) (*provider.Page, 
 		return nil, err
 	}
 
-	cfg, err := decodePageConfig(configJSON)
-	if err != nil {
-		return nil, err
-	}
 	domains, err := p.pageDomains(ctx, pageID)
 	if err != nil {
 		return nil, err
 	}
-
-	pg := &provider.Page{
-		ID:            pageID,
-		TenantID:      tenantID,
-		CustomDomains: domains,
-		Config:        cfg,
-	}
-	if activeDep != nil {
-		pg.ActiveDeploymentID = *activeDep
-	}
-	return pg, nil
+	pg.CustomDomains = domains
+	return &pg, nil
 }
 
 // GetTenant returns the tenant with the given ID, or provider.ErrNotFound.
@@ -151,24 +165,39 @@ func (p *Provider) GetTenant(ctx context.Context, tenantID string) (*provider.Te
 // pageDomains returns the custom domains bound to pageID, sorted for
 // determinism. An empty result returns a nil slice.
 func (p *Provider) pageDomains(ctx context.Context, pageID string) ([]string, error) {
-	rows, err := p.pool.Query(ctx, `SELECT domain FROM custom_domains WHERE page_id = $1 ORDER BY domain`, pageID)
+	byPage, err := p.domainsByPage(ctx, []string{pageID})
+	if err != nil {
+		return nil, err
+	}
+	return byPage[pageID], nil
+}
+
+// domainsByPage returns the custom domains of every requested page, keyed by
+// page ID and sorted for determinism. Pages without domains are absent from the
+// map (a lookup then yields a nil slice, matching GetPage).
+func (p *Provider) domainsByPage(ctx context.Context, pageIDs []string) (map[string][]string, error) {
+	byPage := make(map[string][]string, len(pageIDs))
+	if len(pageIDs) == 0 {
+		return byPage, nil
+	}
+	rows, err := p.pool.Query(ctx,
+		`SELECT page_id, domain FROM custom_domains WHERE page_id = ANY($1) ORDER BY domain`, pageIDs)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 
-	var domains []string
 	for rows.Next() {
-		var d string
-		if err := rows.Scan(&d); err != nil {
+		var pageID, domain string
+		if err := rows.Scan(&pageID, &domain); err != nil {
 			return nil, err
 		}
-		domains = append(domains, d)
+		byPage[pageID] = append(byPage[pageID], domain)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	return domains, nil
+	return byPage, nil
 }
 
 // UpsertTenant inserts or replaces a tenant's configuration.
@@ -209,12 +238,20 @@ func (p *Provider) CreateDeployment(ctx context.Context, d provider.Deployment) 
 	return err
 }
 
-// SetActiveDeployment points a page at a new active deployment.
+// SetActiveDeployment points a page at a new active deployment. An empty
+// deploymentID clears it. It returns provider.ErrNotFound when the page does
+// not exist.
 func (p *Provider) SetActiveDeployment(ctx context.Context, pageID, deploymentID string) error {
-	_, err := p.pool.Exec(ctx,
+	tag, err := p.pool.Exec(ctx,
 		`UPDATE pages SET active_deployment_id = $2, updated_at = now() WHERE id = $1`,
 		pageID, nullString(deploymentID))
-	return err
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return provider.ErrNotFound
+	}
+	return nil
 }
 
 // SetCustomDomains transactionally replaces the full set of custom domains for
