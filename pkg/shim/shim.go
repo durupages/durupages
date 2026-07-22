@@ -17,6 +17,7 @@ package shim
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -29,6 +30,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/durupages/durupages/pkg/api"
@@ -108,6 +110,29 @@ type Options struct {
 	WorkerClient api.WorkerServiceClient
 	// HTTPClient is used for hub bundle downloads (default http.DefaultClient).
 	HTTPClient *http.Client
+
+	// ControllerTLS, when non-nil, secures the gRPC connection to
+	// ControllerAddr; nil dials plaintext. Transport security is opt-in, so an
+	// untouched deployment keeps working unchanged.
+	//
+	// These are *tls.Config rather than tlsconf.ClientOptions on purpose:
+	// turning environment variables into a verification policy is the command's
+	// job (see cmd/durupages-worker-shim), which keeps this library from reading
+	// the environment behind its embedder's back and lets a test hand in a
+	// config built any way it likes.
+	//
+	// Ignored when WorkerClient is injected: that client carries its own
+	// connection and its own credentials.
+	ControllerTLS *tls.Config
+
+	// HubTLS, when non-nil, secures bundle downloads; HubAddr must then be an
+	// https:// URL. It is attached to a clone of HTTPClient's transport, or to
+	// a transport built for the purpose when no HTTPClient is given.
+	//
+	// Passing an HTTPClient whose Transport is not an *http.Transport together
+	// with HubTLS is rejected by New rather than ignored: silently dropping the
+	// config would leave the shim trusting whatever that transport trusts.
+	HubTLS *tls.Config
 }
 
 // Shim is the worker-pod control loop. Construct it with New and drive it with
@@ -200,8 +225,8 @@ func New(opts Options) (*Shim, error) {
 	if s.sweepEvery == 0 {
 		s.sweepEvery = envDuration("DURUPAGES_BUNDLE_SWEEP_INTERVAL", defaultSweepInterval)
 	}
-	if s.httpClient == nil {
-		s.httpClient = http.DefaultClient
+	if err := s.initHubClient(opts); err != nil {
+		return nil, err
 	}
 	s.cor = newCorrelator(s.now)
 	s.emitter = newEmitter(opts.LogClient, opts.LogWriter)
@@ -311,6 +336,44 @@ func (s *Shim) selfTerminate() {
 	}
 }
 
+// initHubClient resolves the HTTP client used for bundle downloads and applies
+// HubTLS to it.
+//
+// Neither the supplied client nor http.DefaultClient is mutated: both are
+// shared, and installing a TLS config into the default transport would change
+// certificate verification for every other user of it in the process. The
+// clone is cheap -- it happens once, at construction.
+func (s *Shim) initHubClient(opts Options) error {
+	if opts.HubTLS == nil {
+		if s.httpClient == nil {
+			s.httpClient = http.DefaultClient
+		}
+		return nil
+	}
+	if opts.HTTPClient == nil {
+		s.httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: opts.HubTLS}}
+		return nil
+	}
+
+	base, _ := http.DefaultTransport.(*http.Transport)
+	if opts.HTTPClient.Transport != nil {
+		t, ok := opts.HTTPClient.Transport.(*http.Transport)
+		if !ok {
+			return errors.New("shim: HubTLS needs an HTTPClient whose Transport is an *http.Transport (or no HTTPClient at all)")
+		}
+		base = t
+	}
+	if base == nil {
+		return errors.New("shim: HubTLS: no *http.Transport to attach it to")
+	}
+	tr := base.Clone()
+	tr.TLSClientConfig = opts.HubTLS
+	clone := *opts.HTTPClient
+	clone.Transport = tr
+	s.httpClient = &clone
+	return nil
+}
+
 // workerClient resolves the controller WorkerService client, dialing
 // ControllerAddr when no client was injected.
 func (s *Shim) workerClient() (api.WorkerServiceClient, func() error, error) {
@@ -320,7 +383,11 @@ func (s *Shim) workerClient() (api.WorkerServiceClient, func() error, error) {
 	if s.opts.ControllerAddr == "" {
 		return nil, nil, errors.New("shim: no controller client or address")
 	}
-	conn, err := grpc.NewClient(s.opts.ControllerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds := insecure.NewCredentials()
+	if s.opts.ControllerTLS != nil {
+		creds = credentials.NewTLS(s.opts.ControllerTLS)
+	}
+	conn, err := grpc.NewClient(s.opts.ControllerAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, nil, err
 	}

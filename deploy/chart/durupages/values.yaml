@@ -89,6 +89,132 @@ logIngest:
   enabled: false
 
 # =============================================================================
+# TLS (opt-in -- off means every hop stays plaintext, exactly as before).
+# =============================================================================
+# tls.enabled makes the three server listeners serve TLS
+#   controller gRPC   :9440   DURUPAGES_TLS_CERT_FILE     / _KEY_FILE
+#   hub bundle HTTP   :9080   DURUPAGES_TLS_CERT_FILE     / _KEY_FILE
+#   hub log gRPC      :9443   DURUPAGES_LOG_TLS_CERT_FILE / _KEY_FILE
+# and tells the clients (router, and the worker pods the controller creates) to
+# dial them over TLS and verify them against the CA below. Ports do not change,
+# so the NetworkPolicy is unaffected.
+#
+# A certificate reaches a listener in one of two ways:
+#   * cert-manager -- set tls.certManager.enabled + an issuerRef; the chart
+#                     creates one Certificate per listener.
+#   * your own     -- set tls.<listener>.existingSecret to a kubernetes.io/tls
+#                     Secret you created yourself.
+# The two can be mixed: an existingSecret wins for its listener and no
+# Certificate is created for it.
+tls:
+  # -- Master switch. Everything below is inert while this is false.
+  enabled: false
+
+  certManager:
+    # -- Issue the certificates below as cert-manager Certificate resources.
+    enabled: false
+    # -- Issuer the Certificates reference. `name` is required when enabled.
+    issuerRef:
+      name: ""
+      kind: Issuer            # Issuer | ClusterIssuer
+      group: cert-manager.io
+    # -- Certificate lifetime / renewal window (empty = issuer defaults).
+    duration: ""              # e.g. 2160h
+    renewBefore: ""           # e.g. 360h
+    # -- cert-manager `spec.privateKey` passthrough.
+    privateKey: {}
+    #  algorithm: ECDSA
+    #  size: 256
+    #  rotationPolicy: Always
+    # -- Labels/annotations stamped onto every issued Secret.
+    secretTemplate: {}
+    #  annotations: {}
+    #  labels: {}
+    # -- `spec.usages` override (empty = cert-manager defaults).
+    usages: []
+    # -- Extra annotations/labels on the Certificate resources themselves.
+    annotations: {}
+    labels: {}
+
+  # CA bundle clients verify servers against. The router mounts it
+  # (DURUPAGES_CA_CERT_FILE); the controller reads it and injects it into worker
+  # pods as inline PEM (DURUPAGES_CA_CERT_PEM), since worker pods live in
+  # another namespace and are created at runtime.
+  caSecret:
+    # -- Secret holding the CA bundle. Empty with certManager.enabled uses the
+    #    issued controller Secret, where cert-manager writes the issuing CA.
+    name: ""
+    # -- Key within that Secret.
+    key: ca.crt
+    # -- Verify against the system trust store instead of a bundle. Use this for
+    #    publicly trusted (ACME) certificates, which carry no ca.crt.
+    systemRoots: false
+
+  # ---------------------------------------------------------------------------
+  # Per-listener certificates. Each block: bring your own Secret with
+  # `existingSecret`, or let cert-manager issue one and shape it with
+  # `dnsNames` / `ipAddresses` / `commonName` / `duration` / `renewBefore`.
+  #
+  # cert-manager SANs always include the Service name in its four in-cluster
+  # forms (`svc`, `svc.ns`, `svc.ns.svc`, `svc.ns.svc.<clusterDomain>`) plus the
+  # host of the matching advertise address; `dnsNames` is added on top.
+  # ---------------------------------------------------------------------------
+
+  # controller gRPC listener.
+  controller:
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    commonName: ""
+    dnsNames: []
+    ipAddresses: []
+    duration: ""
+    renewBefore: ""
+    # -- Name clients verify in the certificate. Set it when the advertised
+    #    address does not match a SAN (a cluster IP, say).
+    serverName: ""
+
+  # hub bundle HTTP listener.
+  hub:
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    commonName: ""
+    dnsNames: []
+    ipAddresses: []
+    duration: ""
+    renewBefore: ""
+    serverName: ""
+
+  # hub log gRPC listener. Leave empty to reuse the hub certificate above;
+  # setting existingSecret / dnsNames / ipAddresses / commonName gives the log
+  # listener its own certificate, so it can live on a separate domain.
+  hubLog:
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    commonName: ""
+    dnsNames: []
+    ipAddresses: []
+    duration: ""
+    renewBefore: ""
+    serverName: ""
+
+  # controller admin API. Reuses the controller certificate unless given its
+  # own here. Note the admin API is normally reached through
+  # `kubectl port-forward`, so a certificate for it wants `localhost` and
+  # `127.0.0.1` among its SANs.
+  admin:
+    existingSecret: ""
+    certKey: tls.crt
+    keyKey: tls.key
+    commonName: ""
+    dnsNames: []
+    ipAddresses: []
+    duration: ""
+    renewBefore: ""
+
+# =============================================================================
 # Worker pods (created by the controller at runtime).
 # =============================================================================
 # -- Namespace the controller creates worker pods in.
@@ -103,6 +229,9 @@ worker:
   image:
     repository: ghcr.io/durupages/durupages-worker
     tag: ""            # defaults to .Chart.AppVersion
+    # -- Pin an exact image by digest ("sha256:..."). Takes precedence
+    #    over tag, which is a moving pointer the registry can repoint.
+    digest: ""
   # -- Default per-tenant worker pod CPU limit (overridable per tenant).
   cpuLimit: "1"
   # -- Default per-tenant worker pod memory limit.
@@ -111,6 +240,23 @@ worker:
   bundleMinIdle: ""
   # -- Worker bundle disk cache cap propagated to worker pods (empty = shim default 2GiB).
   bundleCacheMaxBytes: ""
+  # -- Annotations applied to EVERY worker pod the controller creates.
+  #
+  #    Worker pods are created at runtime by the controller, not by this chart,
+  #    so these cannot be templated onto them directly. The chart stores them in
+  #    a ConfigMap, the controller reads it at startup, and a change to it
+  #    restarts the controller (its checksum is on the pod template) so the next
+  #    pods pick the new set up. Existing worker pods are not rewritten.
+  #
+  #    These are the operator's platform policy: on a key collision they win
+  #    over a tenant's own pod annotations. Keys under durupages.io/ are
+  #    reserved and rejected.
+  #
+  #    podAnnotations:
+  #      prometheus.io/scrape: "true"
+  #      prometheus.io/port: "9090"
+  #      example.com/cost-center: platform
+  podAnnotations: {}
 
 # NetworkPolicy applied in the worker namespace (see ARCHITECTURE section 8).
 # Toggle off if your CNI does not enforce NetworkPolicy.
@@ -140,11 +286,57 @@ controller:
   image:
     repository: ghcr.io/durupages/durupages-controller
     tag: ""            # defaults to .Chart.AppVersion
+    # -- Pin an exact image by digest ("sha256:..."). Takes precedence
+    #    over tag, which is a moving pointer the registry can repoint.
+    digest: ""
     pullPolicy: IfNotPresent
   # controller must be a single replica (in-memory queue); strategy Recreate.
   replicas: 1
   service:
+    type: ClusterIP
     port: 9440
+    # -- NodePort/LoadBalancer only.
+    nodePort: null
+    # -- Extra labels/annotations on the Service object.
+    labels: {}
+    annotations: {}
+    # Full Service surface. Every field below is omitted from the rendered
+    # Service unless set, so Kubernetes' own defaults apply.
+    # -- Pin the cluster IP, or "None" for a headless Service.
+    clusterIP: ""
+    # -- Extra IPs on which nodes accept traffic for this Service.
+    externalIPs: []
+    # -- type=ExternalName target.
+    externalName: ""
+    # -- LoadBalancer only. loadBalancerIP is deprecated upstream; many clouds
+    #    now expect a provider-specific annotation instead.
+    loadBalancerIP: ""
+    loadBalancerClass: ""
+    loadBalancerSourceRanges: []
+    allocateLoadBalancerNodePorts: null
+    # -- Cluster | Local. Local preserves the client source IP.
+    externalTrafficPolicy: ""
+    internalTrafficPolicy: ""
+    # -- LoadBalancer + externalTrafficPolicy=Local only.
+    healthCheckNodePort: null
+    # -- None | ClientIP (+ timeout config).
+    sessionAffinity: ""
+    sessionAffinityConfig: {}
+    # -- Dual-stack: e.g. [IPv4, IPv6] with SingleStack|PreferDualStack|RequireDualStack.
+    ipFamilies: []
+    ipFamilyPolicy: ""
+    # -- Route to pods that are not Ready yet.
+    publishNotReadyAddresses: null
+    # -- PreferClose, on clusters that support it.
+    trafficDistribution: ""
+    # -- Escape hatch merged into spec last; use for fields not modelled above.
+    extraSpec: {}
+  # -- Address the router and the worker pods use to reach the controller.
+  #    Empty computes the in-cluster Service FQDN. Set it when workers sit in an
+  #    isolated network that cannot resolve/route to the Service, or when the
+  #    certificate names a different domain.
+  #    Bare host:port -- it is a gRPC dial target, a URL scheme is rejected.
+  advertiseAddr: ""
   # -- Apply PostgreSQL schema migrations on start.
   migrate: true
   # -- emptyDir sizeLimit for the writable /tmp mount. The root filesystem is
@@ -166,6 +358,9 @@ controller:
     enabled: false
     service:
       port: 9450
+      # -- NodePort/LoadBalancer only. This port is UNAUTHENTICATED; exposing it
+      #    outside the cluster is your own risk.
+      nodePort: null
     # -- Deployment upload body limit in bytes ("" = binary default, 512 MiB).
     maxUploadBytes: ""
   # timeouts / concurrency (no env equivalents -- passed as flags)
@@ -176,6 +371,12 @@ controller:
   maxConcurrencyPerPod: 256
   targetConcurrencyPerPod: 32
   defaultIdleTTL: 60s
+  # -- Extra container args / env, appended last so they override the generated
+  #    ones. An escape hatch for settings this chart does not model yet.
+  extraArgs: []
+  extraEnv: []
+  # - name: DURUPAGES_SOMETHING
+  #   value: "1"
   resources:
     requests:
       cpu: 100m
@@ -209,19 +410,59 @@ router:
   image:
     repository: ghcr.io/durupages/durupages-router
     tag: ""            # defaults to .Chart.AppVersion
+    # -- Pin an exact image by digest ("sha256:..."). Takes precedence
+    #    over tag, which is a moving pointer the registry can repoint.
+    digest: ""
     pullPolicy: IfNotPresent
   replicas: 2
   service:
     # ClusterIP | NodePort | LoadBalancer
     type: ClusterIP
     port: 8080
-    # nodePort: 30080          # used only when type=NodePort
+    # -- NodePort/LoadBalancer only, e.g. 30080.
+    nodePort: null
+    # -- Extra labels/annotations on the Service object.
+    labels: {}
     annotations: {}
+    # Full Service surface. Every field below is omitted from the rendered
+    # Service unless set, so Kubernetes' own defaults apply.
+    # -- Pin the cluster IP, or "None" for a headless Service.
+    clusterIP: ""
+    # -- Extra IPs on which nodes accept traffic for this Service.
+    externalIPs: []
+    # -- type=ExternalName target.
+    externalName: ""
+    # -- LoadBalancer only. loadBalancerIP is deprecated upstream; many clouds
+    #    now expect a provider-specific annotation instead.
+    loadBalancerIP: ""
+    loadBalancerClass: ""
+    loadBalancerSourceRanges: []
+    allocateLoadBalancerNodePorts: null
+    # -- Cluster | Local. Local preserves the client source IP.
+    externalTrafficPolicy: ""
+    internalTrafficPolicy: ""
+    # -- LoadBalancer + externalTrafficPolicy=Local only.
+    healthCheckNodePort: null
+    # -- None | ClientIP (+ timeout config).
+    sessionAffinity: ""
+    sessionAffinityConfig: {}
+    # -- Dual-stack: e.g. [IPv4, IPv6] with SingleStack|PreferDualStack|RequireDualStack.
+    ipFamilies: []
+    ipFamilyPolicy: ""
+    # -- Route to pods that are not Ready yet.
+    publishNotReadyAddresses: null
+    # -- PreferClose, on clusters that support it.
+    trafficDistribution: ""
+    # -- Escape hatch merged into spec last; use for fields not modelled above.
+    extraSpec: {}
   # static LRU cache
   staticCacheDir: /var/cache/durupages
   staticCacheMaxBytes: 1073741824   # 1GiB
   staticCacheSize: 2Gi              # emptyDir sizeLimit (>= staticCacheMaxBytes)
   resolveCacheTTL: 10s
+  # -- Extra container args / env, appended last so they override the generated ones.
+  extraArgs: []
+  extraEnv: []
   resources:
     requests:
       cpu: 100m
@@ -255,14 +496,66 @@ hub:
   image:
     repository: ghcr.io/durupages/durupages-hub
     tag: ""            # defaults to .Chart.AppVersion
+    # -- Pin an exact image by digest ("sha256:..."). Takes precedence
+    #    over tag, which is a moving pointer the registry can repoint.
+    digest: ""
     pullPolicy: IfNotPresent
   replicas: 1
   service:
+    type: ClusterIP
     httpPort: 9080     # bundle distribution (HTTP)
     grpcPort: 9443     # log ingest (gRPC)
+    # -- Per-port nodePort, NodePort/LoadBalancer only.
+    httpNodePort: null
+    grpcNodePort: null
+    # -- Extra labels/annotations on the Service object.
+    labels: {}
+    annotations: {}
+    # Full Service surface. Every field below is omitted from the rendered
+    # Service unless set, so Kubernetes' own defaults apply.
+    # -- Pin the cluster IP, or "None" for a headless Service.
+    clusterIP: ""
+    # -- Extra IPs on which nodes accept traffic for this Service.
+    externalIPs: []
+    # -- type=ExternalName target.
+    externalName: ""
+    # -- LoadBalancer only. loadBalancerIP is deprecated upstream; many clouds
+    #    now expect a provider-specific annotation instead.
+    loadBalancerIP: ""
+    loadBalancerClass: ""
+    loadBalancerSourceRanges: []
+    allocateLoadBalancerNodePorts: null
+    # -- Cluster | Local. Local preserves the client source IP.
+    externalTrafficPolicy: ""
+    internalTrafficPolicy: ""
+    # -- LoadBalancer + externalTrafficPolicy=Local only.
+    healthCheckNodePort: null
+    # -- None | ClientIP (+ timeout config).
+    sessionAffinity: ""
+    sessionAffinityConfig: {}
+    # -- Dual-stack: e.g. [IPv4, IPv6] with SingleStack|PreferDualStack|RequireDualStack.
+    ipFamilies: []
+    ipFamilyPolicy: ""
+    # -- Route to pods that are not Ready yet.
+    publishNotReadyAddresses: null
+    # -- PreferClose, on clusters that support it.
+    trafficDistribution: ""
+    # -- Escape hatch merged into spec last; use for fields not modelled above.
+    extraSpec: {}
+  # -- URL workers fetch bundles from. Empty computes the in-cluster Service URL
+  #    (https when tls.enabled, else http).
+  #    A URL SCHEME IS MANDATORY: the worker shim uses this as a URL prefix, and
+  #    without a scheme every download fails with "unsupported protocol scheme".
+  advertiseAddr: ""            # e.g. https://hub.internal:9443
+  # -- Address the router and worker pods send logs to. Empty computes the
+  #    in-cluster Service FQDN. Bare host:port -- a URL scheme is rejected.
+  logAdvertiseAddr: ""         # e.g. hub-logs.internal:9443
   bundleCacheDir: /var/cache/durupages-hub
   bundleCacheMaxBytes: 4294967296   # 4GiB
   bundleCacheSize: 8Gi              # emptyDir sizeLimit (>= bundleCacheMaxBytes)
+  # -- Extra container args / env, appended last so they override the generated ones.
+  extraArgs: []
+  extraEnv: []
   resources:
     requests:
       cpu: 100m

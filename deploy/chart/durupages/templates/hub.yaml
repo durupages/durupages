@@ -8,17 +8,28 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "durupages.componentLabels" (dict "root" . "component" "hub") | nindent 4 }}
+    {{- with .Values.hub.service.labels }}{{ toYaml . | nindent 4 }}{{- end }}
+  {{- with .Values.hub.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
-  type: ClusterIP
+  {{- include "durupages.service.spec" (dict "service" .Values.hub.service) | nindent 2 }}
   ports:
     - name: http
       port: {{ .Values.hub.service.httpPort }}
       targetPort: http
       protocol: TCP
+      {{- with .Values.hub.service.httpNodePort }}
+      nodePort: {{ . }}
+      {{- end }}
     - name: grpc
       port: {{ .Values.hub.service.grpcPort }}
       targetPort: grpc
       protocol: TCP
+      {{- with .Values.hub.service.grpcNodePort }}
+      nodePort: {{ . }}
+      {{- end }}
   selector:
     {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "hub") | nindent 4 }}
 ---
@@ -49,10 +60,13 @@ spec:
       {{- end }}
       containers:
         - name: hub
-          image: "{{ .Values.hub.image.repository }}:{{ .Values.hub.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "durupages.image" (dict "root" . "image" .Values.hub.image) | quote }}
           imagePullPolicy: {{ .Values.hub.image.pullPolicy }}
           args:
             - --worker-jwt-pubkey=/etc/durupages/worker-jwt/{{ .Values.workerJwt.publicKeyKey }}
+            {{- with .Values.hub.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           env:
             - name: DURUPAGES_LISTEN_HTTP
               value: ":{{ .Values.hub.service.httpPort }}"
@@ -61,8 +75,29 @@ spec:
             - name: DURUPAGES_BUNDLE_CACHE_DIR
               value: {{ .Values.hub.bundleCacheDir | quote }}
             - name: DURUPAGES_BUNDLE_CACHE_MAX_BYTES
-              value: {{ .Values.hub.bundleCacheMaxBytes | quote }}
+              # int64 first: YAML parses a large number as a float, and the
+              # binary's strconv.ParseInt rejects "4.294967296e+09", silently
+              # falling back to its own default.
+              value: {{ .Values.hub.bundleCacheMaxBytes | int64 | quote }}
+            {{- if .Values.tls.enabled }}
+            # Bundle HTTP listener certificate.
+            - name: DURUPAGES_TLS_CERT_FILE
+              value: {{ printf "%s/tls.crt" (include "durupages.tls.certDir" .) | quote }}
+            - name: DURUPAGES_TLS_KEY_FILE
+              value: {{ printf "%s/tls.key" (include "durupages.tls.certDir" .) | quote }}
+            {{- if include "durupages.tls.hubLogSeparate" . }}
+            # Log gRPC listener on its own certificate/domain. Left unset, the
+            # hub reuses the bundle listener's certificate for both.
+            - name: DURUPAGES_LOG_TLS_CERT_FILE
+              value: {{ printf "%s/tls.crt" (include "durupages.tls.logCertDir" .) | quote }}
+            - name: DURUPAGES_LOG_TLS_KEY_FILE
+              value: {{ printf "%s/tls.key" (include "durupages.tls.logCertDir" .) | quote }}
+            {{- end }}
+            {{- end }}
             {{- include "durupages.s3Env" . | nindent 12 }}
+            {{- with .Values.hub.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.hub.service.httpPort }}
@@ -84,6 +119,16 @@ spec:
               readOnly: true
             - name: bundle-cache
               mountPath: {{ .Values.hub.bundleCacheDir }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ include "durupages.tls.certDir" . }}
+              readOnly: true
+            {{- if include "durupages.tls.hubLogSeparate" . }}
+            - name: tls-log
+              mountPath: {{ include "durupages.tls.logCertDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
       volumes:
         - name: worker-jwt
           secret:
@@ -91,6 +136,20 @@ spec:
             items:
               - key: {{ .Values.workerJwt.publicKeyKey }}
                 path: {{ .Values.workerJwt.publicKeyKey }}
+        {{- if .Values.tls.enabled }}
+        {{- include "durupages.tls.certVolume" (dict
+              "name" "tls"
+              "secretName" (include "durupages.tls.hubSecretName" .)
+              "certKey" .Values.tls.hub.certKey
+              "keyKey" .Values.tls.hub.keyKey) | nindent 8 }}
+        {{- if include "durupages.tls.hubLogSeparate" . }}
+        {{- include "durupages.tls.certVolume" (dict
+              "name" "tls-log"
+              "secretName" (include "durupages.tls.hubLogSecretName" .)
+              "certKey" .Values.tls.hubLog.certKey
+              "keyKey" .Values.tls.hubLog.keyKey) | nindent 8 }}
+        {{- end }}
+        {{- end }}
         - name: bundle-cache
           emptyDir:
             sizeLimit: {{ .Values.hub.bundleCacheSize }}

@@ -76,12 +76,33 @@ type Options struct {
 	// Now returns the current time; defaults to time.Now. Injectable for tests.
 	Now func() time.Time
 
-	// ControllerAddr / HubAddr are propagated to worker pods via env.
+	// ControllerAddr / HubAddr are the addresses workers are told to use, not
+	// the ones this process listens on; they are propagated to worker pods via
+	// env.
 	ControllerAddr string
 	HubAddr        string
 	// HubLogAddr, when set, enables worker log ingest by propagating
 	// DURUPAGES_HUB_LOG_ADDR; empty keeps workers in pod-log mode.
 	HubLogAddr string
+
+	// WorkerCACertFile is the PEM CA bundle workers verify TLS servers against.
+	// Its contents are re-read per pod creation and injected as inline
+	// DURUPAGES_CA_CERT_PEM (see workertls.go). Empty means workers are told
+	// nothing about a CA, which leaves them on the system roots.
+	WorkerCACertFile string
+	// ControllerTLS / HubLogTLS state whether those endpoints serve TLS. The
+	// worker cannot tell from the address alone, so the controller passes on
+	// what it knows. The hub bundle endpoint needs no such flag: its scheme in
+	// HubAddr already says it.
+	ControllerTLS bool
+	HubLogTLS     bool
+	// ControllerServerName / HubServerName / HubLogServerName override the name
+	// verified in each server's certificate. Set one when the advertised
+	// address does not match a SAN -- a Service reached by cluster IP, say.
+	// Empty leaves the worker to derive the name from the address.
+	ControllerServerName string
+	HubServerName        string
+	HubLogServerName     string
 
 	// BundleMinIdle / BundleCacheMaxBytes / BundleSweepInterval, when set, are
 	// propagated to worker pods as the DURUPAGES_BUNDLE_* tuning envs.
@@ -114,6 +135,11 @@ type Controller struct {
 	// creates them; Run cancels on return.
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// workerCA holds the CA bundle handed to worker pods, nil when none is
+	// configured. It re-reads the file so pods created after a CA rotation get
+	// the new bundle.
+	workerCA *caFileCache
 
 	mu      sync.Mutex
 	tenants map[string]*tenant
@@ -181,16 +207,28 @@ func New(opts Options) (*Controller, error) {
 		return nil, errors.New("controller: signing key has no ed25519 public half")
 	}
 
+	// Load the worker CA up front: a path that cannot be read is an operator
+	// mistake, and failing here beats starting a controller whose every
+	// scale-up quietly fails.
+	var workerCA *caFileCache
+	if opts.WorkerCACertFile != "" {
+		var err error
+		if workerCA, err = newCAFileCache(opts.WorkerCACertFile); err != nil {
+			return nil, err
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Controller{
-		opts:    opts,
-		pub:     pub,
-		now:     opts.Now,
-		ctx:     ctx,
-		cancel:  cancel,
-		tenants: make(map[string]*tenant),
-		leases:  make(map[string]*leaseRec),
-		waiters: make(map[string]*waiter),
+		opts:     opts,
+		pub:      pub,
+		now:      opts.Now,
+		workerCA: workerCA,
+		ctx:      ctx,
+		cancel:   cancel,
+		tenants:  make(map[string]*tenant),
+		leases:   make(map[string]*leaseRec),
+		waiters:  make(map[string]*waiter),
 	}
 	return c, nil
 }

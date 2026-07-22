@@ -1067,8 +1067,8 @@ type LogSink interface {
 | tenant 기본 idle TTL | `--default-idle-ttl` | 60s |
 | worker 이미지 (shim + durupages-workerd) | `--worker-image` | 릴리즈 이미지 |
 | worker namespace | `--worker-namespace` | `durupages-workers` |
-| hub 주소 (shim 에 전파) | `--hub-addr` | - |
-| hub 로그 주소 (설정 시 로깅 활성화, worker 로 전파) | `--hub-log-addr` | - (미설정 = pod log 모드) |
+| hub 주소 (shim 에 전파; 스킴 필수) | `--hub-advertise-addr` | - |
+| hub 로그 주소 (설정 시 로깅 활성화, worker 로 전파) | `--hub-log-advertise-addr` | - (미설정 = pod log 모드) |
 | worker JWT 서명 개인키 (Ed25519) | `--worker-jwt-signing-key` (hub 는 대응 공개키로 검증) | - |
 | admin API 활성화 (별도 포트, 14장) | `--admin-enabled` / `DURUPAGES_ADMIN_ENABLED` | false |
 | admin API listen 주소 | `--admin-listen` / `DURUPAGES_ADMIN_LISTEN` | `:9450` |

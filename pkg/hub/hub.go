@@ -18,6 +18,32 @@
 // to the log, never to the client. Tokens, secret values and the Authorization
 // header are never logged.
 //
+// # Transport security
+//
+// The hub exposes two independent listeners -- bundle distribution over HTTP
+// and log ingest over gRPC -- and this package serves handlers, not sockets:
+// TLS is configured where the listeners are opened, in cmd/durupages-hub.
+//
+// It is opt-in. Without a certificate both listeners serve plaintext, which
+// keeps an existing deployment working unchanged. --tls-cert-file and
+// --tls-key-file (DURUPAGES_TLS_CERT_FILE, DURUPAGES_TLS_KEY_FILE) protect the
+// bundle listener; the log listener reuses that pair unless it is given its own
+// through --log-tls-cert-file and --log-tls-key-file
+// (DURUPAGES_LOG_TLS_CERT_FILE, DURUPAGES_LOG_TLS_KEY_FILE). The two are
+// separable because the listeners may be published under different hostnames:
+// bundle downloads through an ingress the worker pods resolve publicly, log
+// ingest on an internal address, each with a certificate naming only its own.
+//
+// Certificates come from package tlsconf, so a pair rewritten in place -- how
+// cert-manager renews a mounted Secret -- is picked up without a restart.
+// Server TLS only: clients are not asked for certificates, and the bundle API
+// authenticates workers with the worker JWT as it does over plaintext.
+//
+// A certificate that is named but unusable (missing file, unreadable key,
+// mismatched pair) fails startup. The hub never falls back to plaintext after
+// being told to serve TLS, because a silent downgrade would put bundles and
+// worker tokens on the wire while the operator believes the hop is protected.
+//
 // See docs/ARCHITECTURE.md sections 7 and 9.
 package hub
 

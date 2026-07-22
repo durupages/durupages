@@ -147,7 +147,9 @@ services:
       - --pages-domain=pages.local
       - --worker-jwt-signing-key=/keys/jwt-priv.pem
       - --controller-addr=172.28.0.10:9440
-      - --hub-addr=http://172.28.0.11:9080
+      # Advertised to worker pods, not dialled by the controller itself. The
+      # scheme is required: the shim uses this verbatim as a URL prefix.
+      - --hub-advertise-addr=http://172.28.0.11:9080
       - --worker-image=durupages/worker:e2e
       - --worker-namespace=durupages-workers
       - --worker-service-account=default

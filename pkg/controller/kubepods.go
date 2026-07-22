@@ -49,6 +49,11 @@ type KubePodsOptions struct {
 	// DefaultCPULimit / DefaultMemLimit apply when a PodSpec omits its own.
 	DefaultCPULimit string
 	DefaultMemLimit string
+	// CommonAnnotations are cluster-wide annotations stamped on every worker
+	// pod, whatever the tenant (see LoadWorkerAnnotationsFile). Empty disables
+	// the feature. Validated by NewKubePods, since bad keys here would fail
+	// every pod creation instead of one.
+	CommonAnnotations map[string]string
 }
 
 // kubePods is the Kubernetes PodManager: it creates bare pods (no
@@ -70,12 +75,22 @@ func NewKubePods(opts KubePodsOptions) (*kubePods, error) {
 	if opts.Image == "" {
 		return nil, errors.New("controller: KubePods Image is required")
 	}
+	if err := validateWorkerAnnotations(opts.CommonAnnotations); err != nil {
+		return nil, err
+	}
 	return &kubePods{opts: opts}, nil
 }
 
 // Create builds and creates a single bare worker pod. Tenant labels/annotations
 // are validated (system prefixes rejected) then merged so the system labels
 // always win.
+//
+// Annotation precedence is tenant first, cluster-wide second: where the two
+// name the same key, the operator's value stands. The cluster-wide set is a
+// platform policy — scrape targets, mesh injection, chargeback — declared once
+// for every worker pod in the cluster, and a policy a tenant can opt out of by
+// naming the same key in its own PodAnnotations is not a policy. Tenants keep
+// every key the operator has not claimed.
 func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 	if err := validateNoSystemKeys(spec.Labels); err != nil {
 		return err
@@ -89,7 +104,7 @@ func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 		labelTenantID:   spec.TenantID,
 		labelGeneration: k.opts.Generation,
 	})
-	annotations := mergeMap(spec.Annotations, nil)
+	annotations := mergeMap(spec.Annotations, k.opts.CommonAnnotations)
 
 	resources, err := k.resourceRequirements(spec)
 	if err != nil {

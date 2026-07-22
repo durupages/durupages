@@ -1,0 +1,142 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+{{/* One cert-manager Certificate per TLS listener.
+
+     A listener with an existingSecret is skipped: the operator brought their
+     own key pair and the chart must not fight them for the Secret name.
+
+     The hub log listener and the admin API only get their own Certificate when
+     they were asked for one (see durupages.tls.hubLogSeparate); otherwise they
+     reuse the sibling listener's certificate, which is what the binaries do
+     when the log/admin certificate paths are left unset. */}}
+
+{{- define "durupages.tls.certificate" -}}
+{{- $root := .root -}}
+{{- $cm := $root.Values.tls.certManager -}}
+{{- $cfg := .cfg }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ .name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" $root "component" .component) | nindent 4 }}
+    {{- with $cm.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $cm.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  secretName: {{ .secretName }}
+  {{- with $cfg.commonName }}
+  commonName: {{ . | quote }}
+  {{- end }}
+  dnsNames:
+    {{- range .dnsNames }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- with $cfg.ipAddresses }}
+  ipAddresses:
+    {{- range . }}
+    - {{ . | quote }}
+    {{- end }}
+  {{- end }}
+  {{- with (default $cm.duration $cfg.duration) }}
+  duration: {{ . | quote }}
+  {{- end }}
+  {{- with (default $cm.renewBefore $cfg.renewBefore) }}
+  renewBefore: {{ . | quote }}
+  {{- end }}
+  {{- with $cm.usages }}
+  usages:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $cm.privateKey }}
+  privateKey:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- with $cm.secretTemplate }}
+  secretTemplate:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  issuerRef:
+    name: {{ $cm.issuerRef.name | quote }}
+    kind: {{ $cm.issuerRef.kind | default "Issuer" }}
+    group: {{ $cm.issuerRef.group | default "cert-manager.io" }}
+{{- end -}}
+
+{{/* The four in-cluster names a Service answers to. Returned comma-joined
+     because a template can only return a string. */}}
+{{- define "durupages.tls.svcSANs" -}}
+{{ .svc }},{{ .svc }}.{{ .ns }},{{ .svc }}.{{ .ns }}.svc,{{ .svc }}.{{ .ns }}.svc.{{ .domain }}
+{{- end -}}
+
+{{- if and .Values.tls.enabled .Values.tls.certManager.enabled }}
+{{- $ns := .Release.Namespace }}
+{{- $domain := .Values.clusterDomain }}
+{{- $full := include "durupages.fullname" . }}
+{{- $ctrlSvc := include "durupages.controller.name" . }}
+{{- $hubSvc := include "durupages.hub.name" . }}
+{{- $ctrlSANs := include "durupages.tls.svcSANs" (dict "svc" $ctrlSvc "ns" $ns "domain" $domain) | splitList "," }}
+{{- $hubSANs := include "durupages.tls.svcSANs" (dict "svc" $hubSvc "ns" $ns "domain" $domain) | splitList "," }}
+
+{{/* The advertised host is added automatically: an override exists precisely
+     because clients reach the endpoint under that name, so a certificate
+     without it in its SANs could never verify. A bare IP is skipped -- it
+     belongs in ipAddresses, and a DNS SAN holding an IP is rejected by some
+     issuers. */}}
+{{- $hubLogSANs := $hubSANs }}
+{{- $ctrlAdv := include "durupages.hostOf" (include "durupages.controllerAddr" .) }}
+{{- if regexMatch "[a-zA-Z]" $ctrlAdv }}{{ $ctrlSANs = append $ctrlSANs $ctrlAdv }}{{ end }}
+{{- $hubAdv := include "durupages.hostOf" (include "durupages.hubBundleAddr" .) }}
+{{- if regexMatch "[a-zA-Z]" $hubAdv }}{{ $hubSANs = append $hubSANs $hubAdv }}{{ end }}
+{{- $hubLogAdv := include "durupages.hostOf" (include "durupages.hubLogAddr" .) }}
+{{- if regexMatch "[a-zA-Z]" $hubLogAdv }}{{ $hubLogSANs = append $hubLogSANs $hubLogAdv }}{{ end }}
+
+{{- if not .Values.tls.controller.existingSecret }}
+{{- include "durupages.tls.certificate" (dict
+      "root" .
+      "component" "controller"
+      "name" (printf "%s-controller-tls" $full)
+      "secretName" (include "durupages.tls.controllerSecretName" .)
+      "cfg" .Values.tls.controller
+      "dnsNames" (concat $ctrlSANs .Values.tls.controller.dnsNames | uniq)) }}
+{{- end }}
+
+{{- if not .Values.tls.hub.existingSecret }}
+{{- include "durupages.tls.certificate" (dict
+      "root" .
+      "component" "hub"
+      "name" (printf "%s-hub-tls" $full)
+      "secretName" (include "durupages.tls.hubSecretName" .)
+      "cfg" .Values.tls.hub
+      "dnsNames" (concat $hubSANs .Values.tls.hub.dnsNames | uniq)) }}
+{{- end }}
+
+{{- if and (include "durupages.tls.hubLogSeparate" .) (not .Values.tls.hubLog.existingSecret) }}
+{{- include "durupages.tls.certificate" (dict
+      "root" .
+      "component" "hub"
+      "name" (printf "%s-hub-log-tls" $full)
+      "secretName" (include "durupages.tls.hubLogSecretName" .)
+      "cfg" .Values.tls.hubLog
+      "dnsNames" (concat $hubLogSANs .Values.tls.hubLog.dnsNames | uniq)) }}
+{{- end }}
+
+{{/* The admin API is normally reached through `kubectl port-forward`, so
+     localhost is part of its default SAN set -- without it every port-forwarded
+     call would fail the hostname check. */}}
+{{- if and .Values.controller.adminApi.enabled (include "durupages.tls.adminSeparate" .) (not .Values.tls.admin.existingSecret) }}
+{{- include "durupages.tls.certificate" (dict
+      "root" .
+      "component" "controller"
+      "name" (printf "%s-admin-tls" $full)
+      "secretName" (include "durupages.tls.adminSecretName" .)
+      "cfg" .Values.tls.admin
+      "dnsNames" (concat $ctrlSANs (list "localhost") .Values.tls.admin.dnsNames | uniq)) }}
+{{- end }}
+{{- end }}

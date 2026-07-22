@@ -30,6 +30,129 @@ func newKubePodsForTest(t *testing.T) (*kubePods, *fake.Clientset) {
 	return kp, cs
 }
 
+// newKubePodsWithCommonAnnotations is newKubePodsForTest plus the cluster-wide
+// annotation set.
+func newKubePodsWithCommonAnnotations(t *testing.T, common map[string]string) (*kubePods, *fake.Clientset) {
+	t.Helper()
+	cs := fake.NewSimpleClientset()
+	kp, err := NewKubePods(KubePodsOptions{
+		Client:            cs,
+		Namespace:         "durupages-workers",
+		Image:             "durupages/worker:latest",
+		Generation:        "gen-abc123",
+		CommonAnnotations: common,
+	})
+	if err != nil {
+		t.Fatalf("NewKubePods: %v", err)
+	}
+	return kp, cs
+}
+
+// createdPod creates spec and returns the resulting pod.
+func createdPod(t *testing.T, kp *kubePods, cs *fake.Clientset, spec PodSpec) *corev1.Pod {
+	t.Helper()
+	if err := kp.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	pod, err := cs.CoreV1().Pods("durupages-workers").Get(context.Background(), spec.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	return pod
+}
+
+// TestKubePodsCommonAnnotationsOnly checks operator annotations reach a pod
+// whose tenant declared none.
+func TestKubePodsCommonAnnotationsOnly(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, map[string]string{
+		"prometheus.io/scrape": "true",
+		"prometheus.io/port":   "9090",
+	})
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+	if pod.Annotations["prometheus.io/scrape"] != "true" || pod.Annotations["prometheus.io/port"] != "9090" {
+		t.Fatalf("common annotations missing: %v", pod.Annotations)
+	}
+}
+
+// TestKubePodsTenantAnnotationsWithoutCommon checks the feature stays out of
+// the way when no common set is configured.
+func TestKubePodsTenantAnnotationsWithoutCommon(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, nil)
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Annotations: map[string]string{"example.com/note": "hi"},
+	})
+	if len(pod.Annotations) != 1 || pod.Annotations["example.com/note"] != "hi" {
+		t.Fatalf("tenant annotations wrong: %v", pod.Annotations)
+	}
+}
+
+// TestKubePodsCommonAnnotationsWinOverTenant pins the precedence: the operator's
+// cluster-wide policy is not something a tenant can opt out of by naming the
+// same key, while keys the operator has not claimed still belong to the tenant.
+func TestKubePodsCommonAnnotationsWinOverTenant(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, map[string]string{
+		"prometheus.io/scrape":    "true",
+		"sidecar.istio.io/inject": "false",
+	})
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Annotations: map[string]string{
+			"prometheus.io/scrape": "false", // tenant tries to opt out
+			"example.com/note":     "hi",    // tenant's own key, untouched
+		},
+	})
+	if pod.Annotations["prometheus.io/scrape"] != "true" {
+		t.Fatalf("tenant overrode a common annotation: %v", pod.Annotations)
+	}
+	if pod.Annotations["sidecar.istio.io/inject"] != "false" {
+		t.Fatalf("common annotation missing: %v", pod.Annotations)
+	}
+	if pod.Annotations["example.com/note"] != "hi" {
+		t.Fatalf("tenant annotation lost: %v", pod.Annotations)
+	}
+}
+
+// TestKubePodsCommonAnnotationsLeaveSystemLabelsAlone checks the labels that
+// reconcile relies on are unaffected by the annotation merge.
+func TestKubePodsCommonAnnotationsLeaveSystemLabelsAlone(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, map[string]string{"prometheus.io/scrape": "true"})
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Labels: map[string]string{"team": "web"},
+	})
+	if pod.Labels[labelAppName] != appNameWorker || pod.Labels[labelTenantID] != "acme" ||
+		pod.Labels[labelGeneration] != "gen-abc123" {
+		t.Fatalf("system labels disturbed: %v", pod.Labels)
+	}
+	if pod.Labels["team"] != "web" {
+		t.Fatalf("tenant label lost: %v", pod.Labels)
+	}
+	if _, ok := pod.Labels["prometheus.io/scrape"]; ok {
+		t.Fatalf("annotation leaked into labels: %v", pod.Labels)
+	}
+}
+
+// TestNewKubePodsRejectsBadCommonAnnotations checks the validation also guards
+// callers that build the map themselves rather than reading the file.
+func TestNewKubePodsRejectsBadCommonAnnotations(t *testing.T) {
+	for _, common := range []map[string]string{
+		{"bad key!": "x"},
+		{labelTenantID: "evil"},
+		{"app.kubernetes.io/name": "spoof"},
+	} {
+		_, err := NewKubePods(KubePodsOptions{
+			Client:            fake.NewSimpleClientset(),
+			Namespace:         "durupages-workers",
+			Image:             "durupages/worker:latest",
+			CommonAnnotations: common,
+		})
+		if err == nil {
+			t.Fatalf("NewKubePods accepted %v", common)
+		}
+	}
+}
+
 func TestKubePodsCreateBuildsHardenedPod(t *testing.T) {
 	kp, cs := newKubePodsForTest(t)
 	ctx := context.Background()

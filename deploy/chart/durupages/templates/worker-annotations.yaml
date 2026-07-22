@@ -1,0 +1,26 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+{{/* Annotations the controller stamps onto every worker pod it creates.
+
+     Worker pods are created at runtime, in another namespace, by the
+     controller -- this chart never templates one -- so the values cannot be
+     rendered onto them. They travel as a ConfigMap the controller reads at
+     startup instead. Reading once is enough because the controller's pod
+     template carries this ConfigMap's checksum, so changing it rolls the
+     controller and the new set applies to pods created after that.
+
+     Rendered only when there is something to say, so an empty map leaves no
+     ConfigMap, no volume and no flag behind. */}}
+{{- if .Values.worker.podAnnotations }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "durupages.workerAnnotationsName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+data:
+  {{ include "durupages.workerAnnotationsKey" . }}: |
+    {{- include "durupages.workerAnnotationsYAML" . | nindent 4 }}
+{{- end }}
