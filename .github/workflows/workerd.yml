@@ -155,6 +155,26 @@ jobs:
           ./native/durupages-workerd/build.sh
           ./native/durupages-workerd/bin/durupages-workerd --version
 
+      - name: Verify the binary runs on the runtime base image
+        # The binary is compiled on the runner, not in a container, so its glibc
+        # floor is the RUNNER's. Running it here only proves it works on the
+        # runner. It shipped once linked against GLIBC_2.38 into a bookworm
+        # (2.36) image and died at startup, turning every request into a 502
+        # that named no cause. Run it against the actual runtime base so an ABI
+        # mismatch fails the build instead of production. The base is read out
+        # of the Dockerfile so the two cannot drift apart.
+        run: |
+          set -euo pipefail
+          base="$(awk '/AS worker-native/ {print $2}' Dockerfile)"
+          if [ -z "$base" ]; then
+            echo "::error::could not find the worker-native base image in Dockerfile"
+            exit 1
+          fi
+          echo "runtime base: $base"
+          docker run --rm --entrypoint /bin/sh \
+            -v "$PWD/native/durupages-workerd/bin:/durupages:ro" "$base" \
+            -c '/durupages/durupages-workerd --version'
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:

@@ -62,7 +62,17 @@ ENTRYPOINT ["/durupages-worker-shim"]
 # native/durupages-workerd/bin/durupages-workerd (the workerd build workflow
 # runs native/durupages-workerd/build.sh before `docker build --target
 # worker-native`). It only depends on glibc (libc++ is statically linked).
-FROM debian:bookworm-slim AS worker-native
+#
+# GLIBC: this base must be at least as new as whatever built the binary, which
+# is the workerd.yml runner (ubuntu-24.04, glibc 2.39) and NOT a container.
+# bookworm ships glibc 2.36, so the binary linked against GLIBC_2.38/2.39 and
+# died at startup with
+#   durupages-workerd: /lib/.../libc.so.6: version `GLIBC_2.38' not found
+# leaving every request answering 502. trixie ships 2.41. glibc is backward
+# compatible, so a newer runtime running an older-built binary is fine; the
+# reverse is not. workerd.yml smoke-tests the binary against THIS image, so a
+# future runner bump fails the build instead of shipping a broken image.
+FROM debian:trixie-slim AS worker-native
 RUN useradd -u 10001 -r shim && useradd -u 10002 -r workerd
 COPY native/durupages-workerd/bin/durupages-workerd /usr/local/bin/durupages-workerd
 COPY --from=build /out/durupages-worker-shim /durupages-worker-shim
