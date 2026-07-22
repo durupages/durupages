@@ -25,10 +25,14 @@ import (
 const (
 	logMsgProxyRejected = "shim: proxy request rejected"
 	logMsgProxyFailed   = "shim: proxy request failed"
-	logMsgLoadFailed    = "shim: bundle load failed"
-	logMsgLoaded        = "shim: bundle loaded"
-	logMsgAssetsFailed  = "shim: assets request failed"
-	logMsgTailRejected  = "shim: tail collector request rejected"
+	// logMsgWorkerError marks a 5xx the worker's own code produced, as opposed
+	// to the shim failing to serve it. The distinction is the whole point: it
+	// says the platform did its job and the page's code did not.
+	logMsgWorkerError  = "shim: worker returned server error"
+	logMsgLoadFailed   = "shim: bundle load failed"
+	logMsgLoaded       = "shim: bundle loaded"
+	logMsgAssetsFailed = "shim: assets request failed"
+	logMsgTailRejected = "shim: tail collector request rejected"
 )
 
 // log returns the logger to use: the one configured on Options, or the process

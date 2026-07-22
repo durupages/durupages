@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/durupages/durupages/pkg/api"
+	"github.com/durupages/durupages/pkg/runtime"
 )
 
 // TestLoadFailureIsLoggedWithRequestID is the regression test for the failure
@@ -371,5 +372,63 @@ func TestRequestIDReachesTheHub(t *testing.T) {
 			t.Fatalf("hub fetch %d carried request id %q, want %q "+
 				"(the router->shim->hub correlation chain is broken)", i, got, requestID)
 		}
+	}
+}
+
+// When the worker's own code returns a 5xx the shim is doing its job, so none
+// of its failure paths fire -- yet the router logs "worker returned server
+// error" and, before this, the worker side stayed completely silent. The
+// worker's exception has to reach the operational log, redacted.
+func TestWorkerServerErrorIsLogged(t *testing.T) {
+	const secretVal = "supersecretvalue"
+	h, hub := newHarness(t, harnessOpts{
+		runtimeHook: func(spec runtime.InstanceSpec, w http.ResponseWriter, r *http.Request) {
+			rid := r.Header.Get(api.HeaderRequestID)
+			emitTrace(t, spec.TailEndpoint, rid, map[string]any{
+				"scriptName": "blog",
+				"exceptions": []map[string]any{{
+					"timestamp": 1000, "name": "TypeError",
+					"message": "cannot read properties of undefined, token=" + secretVal,
+				}},
+				"event": map[string]any{
+					"request":  map[string]any{"url": "http://blog/api/x", "method": "GET", "headers": map[string]any{"x-durupages-request-id": rid}},
+					"response": map[string]any{"status": 500},
+				},
+			})
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte("internal error"))
+		},
+	})
+	hub.set("acme", "blog", "dep1", buildBundleTar(t, bundleSpec{
+		tenant: "acme", page: "blog", dep: "dep1",
+		secret: map[string]string{"TOKEN": secretVal},
+	}))
+
+	resp, _ := h.proxyRequest("blog", "dep1", "werr-1")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want the worker's 500 proxied through", resp.StatusCode)
+	}
+
+	line := h.opsLine(logMsgWorkerError)
+	if line == nil {
+		t.Fatalf("no %q line; the worker side is silent about its own 5xx.\nlines: %v",
+			logMsgWorkerError, h.opsLines())
+	}
+	if line["level"] != "ERROR" {
+		t.Errorf("level = %v, want ERROR", line["level"])
+	}
+	if line["requestId"] != "werr-1" {
+		t.Errorf("requestId = %v, want werr-1 (must join the router's line)", line["requestId"])
+	}
+	if line["status"] != float64(500) {
+		t.Errorf("status = %v, want 500", line["status"])
+	}
+	exc, _ := line["exception"].(string)
+	if !strings.Contains(exc, "TypeError") || !strings.Contains(exc, "cannot read properties") {
+		t.Errorf("exception = %q, want the worker's own throw", exc)
+	}
+	if strings.Contains(exc, secretVal) {
+		t.Fatalf("the page secret leaked into the operational log: %q", exc)
 	}
 }

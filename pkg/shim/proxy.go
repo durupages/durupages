@@ -193,7 +193,41 @@ func (s *Shim) recordUsage(r *http.Request, claims *workerauth.LeaseClaims, depl
 	if rd := s.redactor.Load(); rd != nil {
 		rd.apply(&u)
 	}
+	// A 5xx the worker itself produced is not a shim failure, so none of the
+	// error paths above logged it -- yet from the outside it is indistinguishable
+	// from one, and the router can only report "the worker returned 5xx".
+	// Record it here, where the correlated trace has already supplied the
+	// worker's own exception, and after redaction so page secrets that appear in
+	// an exception message do not reach the operational log.
+	if status >= 500 {
+		s.log().Error(logMsgWorkerError,
+			slog.String("requestId", requestID),
+			slog.String("tenantId", s.opts.TenantID),
+			slog.String("pageId", claims.PageID),
+			slog.String("deploymentId", deploymentID),
+			slog.Int("status", status),
+			slog.String("exception", firstException(u.Exceptions)))
+	}
 	s.emitter.emit(u)
+}
+
+// firstException renders the worker exception that explains a 5xx. Workers
+// usually throw one; the rest are in the usage event. The empty string means
+// the worker returned the status without throwing (or the trace did not
+// correlate in time), which is itself the useful signal.
+func firstException(exs []usage.Exception) string {
+	if len(exs) == 0 {
+		return ""
+	}
+	e := exs[0]
+	switch {
+	case e.Name != "" && e.Message != "":
+		return e.Name + ": " + e.Message
+	case e.Message != "":
+		return e.Message
+	default:
+		return e.Name
+	}
 }
 
 // originalURL reconstructs the client-facing URL of the request.
