@@ -34,14 +34,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build:
-    name: build durupages-workerd
+  # Shared version/ref computation so both platform builds and the merge job
+  # agree on the exact same tag without recomputing it independently.
+  version:
+    name: compute version
     runs-on: ubuntu-latest
-    # V8 is compiled from source on the first run for a given workerd ref; the
-    # bazel disk cache (restored below) makes later runs fast.
-    timeout-minutes: 360
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.version.outputs.version }}
+      workerd_ref: ${{ steps.version.outputs.workerd_ref }}
     steps:
       - uses: actions/checkout@v7
 
@@ -66,6 +67,26 @@ jobs:
           echo "Building $VERSION (workerd ref ${WORKERD_REF})"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "workerd_ref=$WORKERD_REF" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build durupages-workerd (${{ matrix.arch }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    # V8 is compiled from source on the first run for a given (workerd ref,
+    # arch) pair; the bazel disk cache (restored below) makes later runs fast.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: blacksmith-4vcpu-ubuntu-2404
+            bazelisk_asset: bazelisk-linux-amd64
+          - arch: arm64
+            runner: blacksmith-4vcpu-ubuntu-2404-arm
+            bazelisk_asset: bazelisk-linux-arm64
+    steps:
+      - uses: actions/checkout@v7
 
       - name: Free disk space
         # A full workerd + V8 build needs far more than the ~14 GB free on a
@@ -99,7 +120,7 @@ jobs:
             tcl git ca-certificates
           # bazelisk honours the repo's .bazelversion and fetches the right bazel.
           sudo curl -fsSL -o /usr/local/bin/bazelisk \
-            https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/bazelisk-linux-amd64
+            "https://github.com/bazelbuild/bazelisk/releases/download/v1.29.0/${{ matrix.bazelisk_asset }}"
           sudo chmod +x /usr/local/bin/bazelisk
           clang-20 --version | head -1
           bazelisk version || true
@@ -107,12 +128,13 @@ jobs:
       - name: Restore bazel disk cache
         uses: actions/cache@v6
         with:
-          # build.sh points its --disk_cache here; keyed by the workerd ref so a
-          # repin gets a fresh cache while same-ref rebuilds stay warm.
+          # build.sh points its --disk_cache here; keyed by (arch, workerd ref)
+          # so a repin gets a fresh cache while same-ref rebuilds stay warm. The
+          # disk cache holds compiled objects and is not portable across arches.
           path: ~/.cache/durupages-workerd
-          key: workerd-diskcache-${{ steps.version.outputs.workerd_ref }}
+          key: workerd-diskcache-${{ matrix.arch }}-${{ needs.version.outputs.workerd_ref }}
           restore-keys: |
-            workerd-diskcache-
+            workerd-diskcache-${{ matrix.arch }}-
 
       - name: Build durupages-workerd
         env:
@@ -121,7 +143,7 @@ jobs:
           # that build.sh would otherwise prefer, and it has no matching libc++.
           DURUPAGES_CC: clang-20
           DURUPAGES_CXX: clang++-20
-          # ubuntu-latest has 4 cores / 16 GB RAM; keep memory pressure sane.
+          # Matches the Blacksmith 4vcpu runner class used for both arches.
           DURUPAGES_BUILD_JOBS: '4'
           DURUPAGES_BUILD_MEM_MB: '12000'
         run: |
@@ -129,9 +151,9 @@ jobs:
           ./native/durupages-workerd/bin/durupages-workerd --version
 
       - name: Upload binary artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
-          name: durupages-workerd-${{ steps.version.outputs.version }}
+          name: durupages-workerd-${{ needs.version.outputs.version }}-${{ matrix.arch }}
           path: native/durupages-workerd/bin/durupages-workerd
           if-no-files-found: error
           retention-days: 14
@@ -148,32 +170,90 @@ jobs:
         if: ${{ inputs.push_image }}
         uses: docker/setup-buildx-action@v3
 
-      - name: Build & push worker-native image
+      - name: Build & push worker-native image (${{ matrix.arch }}, by digest)
         if: ${{ inputs.push_image }}
+        id: build_image
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./Dockerfile
           target: worker-native
-          platforms: linux/amd64
-          push: true
-          tags: ghcr.io/${{ github.repository_owner }}/durupages-worker:${{ steps.version.outputs.version }}
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/durupages-worker,push-by-digest=true,name-canonical=true,push=true
           labels: |
             org.opencontainers.image.title=durupages-worker
             org.opencontainers.image.description=DuruPages worker (shim + durupages-workerd)
-            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
+      - name: Export digest
+        if: ${{ inputs.push_image }}
+        run: |
+          mkdir -p "${{ runner.temp }}/digests"
+          digest="${{ steps.build_image.outputs.digest }}"
+          touch "${{ runner.temp }}/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        if: ${{ inputs.push_image }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge worker-native image
+    if: ${{ inputs.push_image }}
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      REGISTRY_IMAGE: ghcr.io/${{ github.repository_owner }}/durupages-worker
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          docker buildx imagetools create \
+            -t "${REGISTRY_IMAGE}:${{ needs.version.outputs.version }}" \
+            $(printf "${REGISTRY_IMAGE}@sha256:%s " *)
+
+      - name: Inspect image
+        run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:${{ needs.version.outputs.version }}"
+
+  summary:
+    name: summary
+    needs: [version, build, merge]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: Summary
         run: |
           {
-            echo "## durupages-workerd ${{ steps.version.outputs.version }}"
+            echo "## durupages-workerd ${{ needs.version.outputs.version }}"
             echo ""
-            echo "- workerd ref: \`${{ steps.version.outputs.workerd_ref }}\`"
-            echo "- binary artifact: durupages-workerd-${{ steps.version.outputs.version }}"
+            echo "- workerd ref: \`${{ needs.version.outputs.workerd_ref }}\`"
+            echo "- binary artifacts: durupages-workerd-${{ needs.version.outputs.version }}-amd64, -arm64"
             if [ "${{ inputs.push_image }}" = "true" ]; then
-              echo "- image: \`ghcr.io/${{ github.repository_owner }}/durupages-worker:${{ steps.version.outputs.version }}\`"
+              echo "- image: \`ghcr.io/${{ github.repository_owner }}/durupages-worker:${{ needs.version.outputs.version }}\` (linux/amd64, linux/arm64)"
             else
               echo "- image: not pushed (push_image=false)"
             fi
