@@ -191,8 +191,12 @@ func summarize(m *manifest.Manifest) manifestSummary {
 // extractUpload streams the request body into a fresh temporary directory and
 // returns the build output root inside it. The caller must always invoke
 // cleanup, which is non-nil as soon as the directory exists.
+//
+// The directory is created under Options.TempDir (os.TempDir() when unset);
+// a deployment with a read-only root filesystem points that option at a
+// writable volume.
 func (s *Server) extractUpload(w http.ResponseWriter, r *http.Request) (root string, cleanup func(), err error) {
-	tmp, err := os.MkdirTemp("", "durupages-upload-")
+	tmp, err := os.MkdirTemp(s.tempDir, "durupages-upload-")
 	if err != nil {
 		return "", nil, fmt.Errorf("create temp dir: %w", err)
 	}

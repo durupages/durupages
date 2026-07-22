@@ -15,6 +15,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -83,11 +84,25 @@ type config struct {
 	adminEnabled   bool
 	adminListen    string
 	adminMaxUpload int64
+	adminTempDir   string
 	s3             s3.Options
+}
+
+// setupLogging installs a JSON slog handler on stderr as the process default.
+//
+// slog.SetDefault also redirects the standard log package through this
+// handler, so the log.Printf calls in this binary and the admin API's
+// structured request lines end up in one consistent JSON stream instead of two
+// competing formats.
+func setupLogging() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
 }
 
 func main() {
 	version.MaybePrint()
+	setupLogging()
 	var (
 		listen        = flag.String("listen", envOr("DURUPAGES_LISTEN", ":9440"), "gRPC listen address")
 		pgDSN         = flag.String("pg-dsn", envOr("DURUPAGES_PG_DSN", ""), "PostgreSQL DSN (required)")
@@ -120,6 +135,7 @@ func main() {
 		adminEnabled   = flag.Bool("admin-enabled", envOr("DURUPAGES_ADMIN_ENABLED", "false") == "true", "enable the unauthenticated admin API on --admin-listen")
 		adminListen    = flag.String("admin-listen", envOr("DURUPAGES_ADMIN_LISTEN", ":9450"), "admin API listen address (separate port)")
 		adminMaxUpload = flag.Int64("admin-max-upload-bytes", envOrInt64("DURUPAGES_ADMIN_MAX_UPLOAD_BYTES", 512<<20), "admin API deployment upload size limit")
+		adminTempDir   = flag.String("admin-temp-dir", envOr("DURUPAGES_ADMIN_TEMP_DIR", ""), "directory for admin API upload extraction (empty = os.TempDir(); set to a writable volume when the root filesystem is read-only)")
 
 		s3Endpoint  = flag.String("s3-endpoint", envOr("DURUPAGES_S3_ENDPOINT", ""), "S3 endpoint (admin API uploads)")
 		s3Region    = flag.String("s3-region", envOr("DURUPAGES_S3_REGION", "us-east-1"), "S3 region (admin API uploads)")
@@ -144,6 +160,7 @@ func main() {
 		},
 		bundleMinIdle: *bundleMinIdle, bundleCacheMax: *bundleCacheMax,
 		adminEnabled: *adminEnabled, adminListen: *adminListen, adminMaxUpload: *adminMaxUpload,
+		adminTempDir: *adminTempDir,
 		s3: s3.Options{Endpoint: *s3Endpoint, Region: *s3Region, Bucket: *s3Bucket,
 			AccessKey: *s3AccessKey, SecretKey: *s3SecretKey, UsePathStyle: *s3PathStyle},
 	}
@@ -276,6 +293,12 @@ func startAdminAPI(ctx context.Context, cfg config, prov *postgres.Provider, err
 		Admin:          admin,
 		Storage:        store,
 		MaxUploadBytes: cfg.adminMaxUpload,
+		// New rejects an unusable TempDir right here, so a controller that
+		// cannot extract uploads (read-only root filesystem, no writable
+		// volume) fails to start instead of failing on the first deployment.
+		TempDir: cfg.adminTempDir,
+		// Same handler as the rest of the binary: one JSON stream on stderr.
+		Logger: slog.Default().With("component", "adminapi"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("admin api: %w", err)

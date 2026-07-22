@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -46,9 +48,13 @@ func newTestAPI(t *testing.T) *testAPI {
 		storage:  memstorage.New(),
 	}
 	h, err := adminapi.New(adminapi.Options{
-		Provider:   api.provider,
-		Admin:      api.provider,
-		Storage:    api.storage,
+		Provider: api.provider,
+		Admin:    api.provider,
+		Storage:  api.storage,
+		// The admin API logs every request to slog.Default() unless told
+		// otherwise; these tests assert on the CLI's output, so keep the
+		// server's request log out of the test output.
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Middleware: []func(http.Handler) http.Handler{api.recordHeaders},
 	})
 	if err != nil {
