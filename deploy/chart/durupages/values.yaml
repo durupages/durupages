@@ -97,7 +97,7 @@ workerServiceAccount: durupages-worker-noperm
 worker:
   # -- Worker image (shim + durupages-workerd) the controller stamps onto pods.
   image:
-    repository: durupages/worker
+    repository: ghcr.io/durupages/durupages-worker
     tag: ""            # defaults to .Chart.AppVersion
   # -- Default per-tenant worker pod CPU limit (overridable per tenant).
   cpuLimit: "1"
@@ -134,7 +134,7 @@ networkPolicy:
 # =============================================================================
 controller:
   image:
-    repository: durupages/controller
+    repository: ghcr.io/durupages/durupages-controller
     tag: ""            # defaults to .Chart.AppVersion
     pullPolicy: IfNotPresent
   # controller must be a single replica (in-memory queue); strategy Recreate.
@@ -200,7 +200,7 @@ controller:
 # =============================================================================
 router:
   image:
-    repository: durupages/router
+    repository: ghcr.io/durupages/durupages-router
     tag: ""            # defaults to .Chart.AppVersion
     pullPolicy: IfNotPresent
   replicas: 2
@@ -248,7 +248,7 @@ router:
 # =============================================================================
 hub:
   image:
-    repository: durupages/hub
+    repository: ghcr.io/durupages/durupages-hub
     tag: ""            # defaults to .Chart.AppVersion
     pullPolicy: IfNotPresent
   replicas: 1

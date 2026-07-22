@@ -108,7 +108,7 @@ policy with `networkPolicy.enabled=false` where the CNI has no enforcement.
 | `workerNamespace` | `durupages-workers` | Namespace for worker pods |
 | `createWorkerNamespace` | `true` | Whether the chart creates the worker namespace |
 | `workerServiceAccount` | `durupages-worker-noperm` | Worker pod ServiceAccount |
-| `worker.image.repository` / `.tag` | `durupages/worker` / appVersion | Worker image the controller stamps onto pods |
+| `worker.image.repository` / `.tag` | `ghcr.io/durupages/durupages-worker` / appVersion | Worker image the controller stamps onto pods |
 | `worker.bundleMinIdle` | `""` | `DURUPAGES_BUNDLE_MIN_IDLE` propagated to workers |
 | `worker.bundleCacheMaxBytes` | `""` | `DURUPAGES_BUNDLE_CACHE_MAX_BYTES` propagated to workers |
 | `networkPolicy.enabled` | `true` | Toggle the worker NetworkPolicy |
