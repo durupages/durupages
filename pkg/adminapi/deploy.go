@@ -55,11 +55,15 @@ func writeAPIError(w http.ResponseWriter, err error) {
 
 // deployResponse is the 201 body of a deployment upload.
 type deployResponse struct {
-	DeploymentID string          `json:"deploymentId"`
-	PageID       string          `json:"pageId"`
-	TenantID     string          `json:"tenantId"`
-	Activated    bool            `json:"activated"`
-	Manifest     manifestSummary `json:"manifest"`
+	DeploymentID string `json:"deploymentId"`
+	PageID       string `json:"pageId"`
+	TenantID     string `json:"tenantId"`
+	Activated    bool   `json:"activated"`
+	// PagesDomain is the domain this controller actually serves pages on, so a
+	// client can report the deployed URL instead of guessing it from its own
+	// configuration. Omitted when the controller was not told one.
+	PagesDomain string          `json:"pagesDomain,omitempty"`
+	Manifest    manifestSummary `json:"manifest"`
 }
 
 // manifestSummary is the deployment manifest reduced to what a deploying
@@ -167,6 +171,7 @@ func (s *Server) handleCreateDeployment(w http.ResponseWriter, r *http.Request) 
 		PageID:       pageID,
 		TenantID:     page.TenantID,
 		Activated:    activate,
+		PagesDomain:  s.pagesDomain,
 		Manifest:     summarize(scanned.Manifest),
 	})
 }

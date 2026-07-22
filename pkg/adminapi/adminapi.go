@@ -101,6 +101,13 @@ type Options struct {
 	// MaxExtractedBytes caps the total number of bytes written while
 	// extracting an uploaded archive. Defaults to four times MaxUploadBytes.
 	MaxExtractedBytes int64
+	// PagesDomain is the apex domain this controller serves pages on, e.g.
+	// "pages.example.com" for a page reachable at "{pageId}.pages.example.com".
+	// It is reported back on a deployment upload so that a client does not have
+	// to be configured with it separately (and cannot report a stale URL when
+	// the controller's domain changes). Optional: when empty the field is
+	// omitted from the response.
+	PagesDomain string
 	// TempDir is the parent directory for the temporary directory a deployment
 	// upload is extracted into. An empty value uses the os.TempDir() default.
 	//
@@ -163,6 +170,7 @@ type Server struct {
 	maxUpload    int64
 	maxExtracted int64
 	tempDir      string
+	pagesDomain  string
 	now          func() time.Time
 
 	// logger may be nil, meaning "resolve slog.Default() per request" so that a
@@ -190,6 +198,7 @@ func New(opts Options) (*Server, error) {
 		maxUpload:    opts.MaxUploadBytes,
 		maxExtracted: opts.MaxExtractedBytes,
 		tempDir:      opts.TempDir,
+		pagesDomain:  strings.TrimSpace(opts.PagesDomain),
 		now:          opts.Now,
 		logger:       opts.Logger,
 	}

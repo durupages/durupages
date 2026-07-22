@@ -293,6 +293,9 @@ func startAdminAPI(ctx context.Context, cfg config, prov *postgres.Provider, err
 		Admin:          admin,
 		Storage:        store,
 		MaxUploadBytes: cfg.adminMaxUpload,
+		// Reported on every upload so `duru deploy` prints the URL this
+		// controller actually serves, rather than the client's own default.
+		PagesDomain: cfg.pagesDomain,
 		// New rejects an unusable TempDir right here, so a controller that
 		// cannot extract uploads (read-only root filesystem, no writable
 		// volume) fails to start instead of failing on the first deployment.

@@ -178,7 +178,7 @@ func (c *cli) run() int {
 		// --tenant/--page flags are the shared ones by name, so both
 		// "duru deploy --tenant acme --page blog" and
 		// "duru --tenant acme --page blog deploy" reach it unchanged.
-		runDeploy(args)
+		c.runDeploy(args)
 		return 0
 	}
 
@@ -216,8 +216,10 @@ func (c *cli) run() int {
 	}
 }
 
-// runDeploy is the original `duru deploy` entry point, unchanged.
-func runDeploy(args []string) {
+// runDeploy is the original `duru deploy` entry point. It still parses with
+// flag.ExitOnError and reports failures with log.Fatal, but its success output
+// goes through the cli's streams so it is redirectable and testable.
+func (c *cli) runDeploy(args []string) {
 	fs := flag.NewFlagSet("deploy", flag.ExitOnError)
 	fs.Usage = func() {
 		fmt.Fprint(os.Stderr, usage)
@@ -230,7 +232,7 @@ func runDeploy(args []string) {
 		pageID   = fs.String("page", "", "page id (required)")
 		depID    = fs.String("deployment", "", "deployment id (default: generated)")
 		domains  = fs.String("domain", "", "comma-separated custom domains (optional; replaces existing)")
-		pagesDom = fs.String("pages-domain", envOr("DURUPAGES_PAGES_DOMAIN", "pages.local"), "pages domain (for the printed URL)")
+		pagesDom = fs.String("pages-domain", envOr("DURUPAGES_PAGES_DOMAIN", "pages.local"), "pages domain for the printed URL (admin mode reports the controller's own domain unless this is set)")
 		secrets  = fs.String("secrets-file", "", "JSON or dotenv file replacing the page's whole secret set, applied before the deployment goes live (\"-\" is stdin)")
 
 		// Admin mode.
@@ -248,6 +250,15 @@ func runDeploy(args []string) {
 	)
 	_ = fs.Parse(args)
 
+	// Both a flag and the environment variable are deliberate choices; only an
+	// untouched default may be replaced by the domain the controller reports.
+	pagesDomSet := os.Getenv("DURUPAGES_PAGES_DOMAIN") != ""
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "pages-domain" {
+			pagesDomSet = true
+		}
+	})
+
 	if *tenantID == "" || *pageID == "" {
 		log.Fatal("duru deploy: --tenant and --page are required")
 	}
@@ -256,12 +267,15 @@ func runDeploy(args []string) {
 	}
 
 	opts := deployOptions{
-		Dir:          *dir,
-		TenantID:     *tenantID,
-		PageID:       *pageID,
-		DeploymentID: *depID,
-		Domains:      *domains,
-		PagesDomain:  *pagesDom,
+		Dir:            *dir,
+		TenantID:       *tenantID,
+		PageID:         *pageID,
+		DeploymentID:   *depID,
+		Domains:        *domains,
+		PagesDomain:    *pagesDom,
+		PagesDomainSet: pagesDomSet,
+		stdout:         c.stdout,
+		stderr:         c.stderr,
 	}
 
 	// Parse the secret file up front: a typo in it must fail before anything
@@ -310,19 +324,44 @@ type deployOptions struct {
 	DeploymentID string
 	Domains      string
 	PagesDomain  string
-	Secrets      *map[string]string
+	// PagesDomainSet records that PagesDomain was chosen deliberately (flag or
+	// environment) rather than left at its default, so that admin mode knows
+	// whether it may adopt the domain the controller reports.
+	PagesDomainSet bool
+	Secrets        *map[string]string
+
+	// stdout/stderr carry the deploy summary. They are nil outside the CLI
+	// entry point, in which case the process streams are used.
+	stdout io.Writer
+	stderr io.Writer
+}
+
+// out is where the deploy summary goes.
+func (o deployOptions) out() io.Writer {
+	if o.stdout != nil {
+		return o.stdout
+	}
+	return os.Stdout
+}
+
+// errOut is where deploy notes go.
+func (o deployOptions) errOut() io.Writer {
+	if o.stderr != nil {
+		return o.stderr
+	}
+	return os.Stderr
 }
 
 // report prints the result of a successful deploy.
 func (o deployOptions) report(staticCount int, hasWorker bool) {
-	fmt.Printf("deployed %s/%s deployment=%s static=%d worker=%v\n",
+	fmt.Fprintf(o.out(), "deployed %s/%s deployment=%s static=%d worker=%v\n",
 		o.TenantID, o.PageID, o.DeploymentID, staticCount, hasWorker)
-	fmt.Printf("url: https://%s.%s/\n", o.PageID, o.PagesDomain)
+	fmt.Fprintf(o.out(), "url: https://%s.%s/\n", o.PageID, o.PagesDomain)
 }
 
 // reportSecrets notes a --secrets-file replacement on stderr, keeping the
 // deploy summary on stdout unchanged. Only the count is printed: no command
 // ever writes a secret value anywhere.
 func (o deployOptions) reportSecrets(n int) {
-	fmt.Fprintf(os.Stderr, "secrets replaced (%d) on page %q\n", n, o.PageID)
+	fmt.Fprintf(o.errOut(), "secrets replaced (%d) on page %q\n", n, o.PageID)
 }
