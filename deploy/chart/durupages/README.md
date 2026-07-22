@@ -43,8 +43,7 @@ helm install durupages deploy/chart/durupages \
   --set s3.bucket=durupages \
   --set s3.accessKey=AKIA... \
   --set s3.secretKey=... \
-  --set controller.pagesDomain=pages.example.com \
-  --set router.pagesDomain=pages.example.com
+  --set pagesDomain=pages.example.com
 ```
 
 Reusing pre-created secrets instead of inline values:
@@ -113,7 +112,7 @@ policy with `networkPolicy.enabled=false` where the CNI has no enforcement.
 | `worker.bundleCacheMaxBytes` | `""` | `DURUPAGES_BUNDLE_CACHE_MAX_BYTES` propagated to workers |
 | `networkPolicy.enabled` | `true` | Toggle the worker NetworkPolicy |
 | `networkPolicy.clusterCIDRs` | RFC1918 blocks | CIDRs excluded from worker external egress |
-| `controller.pagesDomain` / `router.pagesDomain` | `pages.local` | Pages domain |
+| `pagesDomain` | `pages.local` | Pages domain, shared by router and controller |
 | `controller.defaultQueueTimeout` | `30s` | `--default-queue-timeout` |
 | `controller.maxQueueTimeout` | `120s` | `--max-queue-timeout` |
 | `controller.defaultRequestTimeout` | `60s` | `--default-request-timeout` |
@@ -122,6 +121,9 @@ policy with `networkPolicy.enabled=false` where the CNI has no enforcement.
 | `controller.targetConcurrencyPerPod` | `32` | `--target-concurrency-per-pod` |
 | `controller.defaultIdleTTL` | `60s` | `--default-idle-ttl` |
 | `controller.migrate` | `true` | Apply schema migrations on start |
+| `controller.tmpSize` | `4Gi` | writable `/tmp` `emptyDir` sizeLimit (admin API upload staging) |
+| `controller.adminApi.enabled` | `false` | Serve the unauthenticated admin API on its own port |
+| `controller.adminApi.maxUploadBytes` | `""` | Deployment upload body cap (`""` = 512 MiB) |
 | `router.replicas` | `2` | Router replica count |
 | `router.service.type` | `ClusterIP` | `ClusterIP` / `NodePort` / `LoadBalancer` |
 | `router.staticCacheMaxBytes` | `1073741824` | `--static-cache-max-bytes` (1GiB) |

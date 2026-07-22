@@ -17,6 +17,10 @@ fullnameOverride: ""
 # -- Cluster DNS domain, used to build in-cluster Service addresses.
 clusterDomain: cluster.local
 
+# -- Pages domain, e.g. pages.example.com. Requests arrive at {pageId}.{pagesDomain};
+#    shared by the router (host resolution) and controller (lease/deploy admin).
+pagesDomain: pages.local
+
 # -- Image pull secrets applied to every workload ServiceAccount / pod.
 imagePullSecrets: []
 # - name: my-registry-cred
@@ -141,10 +145,13 @@ controller:
   replicas: 1
   service:
     port: 9440
-  # -- Pages domain, e.g. pages.example.com
-  pagesDomain: pages.local
   # -- Apply PostgreSQL schema migrations on start.
   migrate: true
+  # -- emptyDir sizeLimit for the writable /tmp mount. The root filesystem is
+  #    read-only, and the admin API extracts each uploaded deployment under
+  #    /tmp before uploading it to Storage. Keep this above four times
+  #    adminApi.maxUploadBytes (the extracted-size cap the binary enforces).
+  tmpSize: 4Gi
   # Admin API: tenant/page management and deployment upload over HTTP, served
   # on a separate port so `duru deploy --admin-url` needs no database or object
   # storage credentials.
@@ -210,8 +217,6 @@ router:
     port: 8080
     # nodePort: 30080          # used only when type=NodePort
     annotations: {}
-  # -- Pages domain, e.g. pages.example.com
-  pagesDomain: pages.local
   # static LRU cache
   staticCacheDir: /var/cache/durupages
   staticCacheMaxBytes: 1073741824   # 1GiB

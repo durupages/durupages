@@ -155,7 +155,7 @@ helm install durupages deploy/chart/durupages \
   --set-file workerJwt.publicKeyPEM=worker-jwt.pub \
   --set postgres.dsn='postgres://...' \
   --set s3.bucket=durupages \
-  --set router.pagesDomain=pages.example.com
+  --set pagesDomain=pages.example.com
 ```
 
 Chart 는 controller/router/hub 와 worker 네임스페이스·ServiceAccount·RBAC·NetworkPolicy 를 설치합니다. worker Pod 는 controller 가 런타임에 직접 생성합니다. 자세한 값은 [deploy/chart/durupages/README.md](deploy/chart/durupages/README.md) 를 참고하세요.

@@ -67,7 +67,7 @@ spec:
               value: {{ include "durupages.hubLogAddr" . | quote }}
             {{- end }}
             - name: DURUPAGES_PAGES_DOMAIN
-              value: {{ .Values.router.pagesDomain | quote }}
+              value: {{ .Values.pagesDomain | quote }}
             - name: DURUPAGES_STATIC_CACHE_DIR
               value: {{ .Values.router.staticCacheDir | quote }}
             - name: DURUPAGES_STATIC_CACHE_MAX_BYTES

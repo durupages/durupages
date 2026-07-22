@@ -155,7 +155,7 @@ helm install durupages deploy/chart/durupages \
   --set-file workerJwt.publicKeyPEM=worker-jwt.pub \
   --set postgres.dsn='postgres://...' \
   --set s3.bucket=durupages \
-  --set router.pagesDomain=pages.example.com
+  --set pagesDomain=pages.example.com
 ```
 
 The chart installs controller/router/hub plus the worker namespace, ServiceAccount, RBAC and NetworkPolicy. Worker Pods themselves are created by the controller at runtime. See [deploy/chart/durupages/README.md](deploy/chart/durupages/README.md) for the full values reference.

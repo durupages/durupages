@@ -80,7 +80,7 @@ spec:
             - name: DURUPAGES_LISTEN
               value: ":{{ .Values.controller.service.port }}"
             - name: DURUPAGES_PAGES_DOMAIN
-              value: {{ .Values.controller.pagesDomain | quote }}
+              value: {{ .Values.pagesDomain | quote }}
             - name: DURUPAGES_MIGRATE
               value: {{ .Values.controller.migrate | quote }}
             - name: DURUPAGES_CONTROLLER_ADVERTISE_ADDR
@@ -148,6 +148,8 @@ spec:
             - name: worker-jwt
               mountPath: /etc/durupages/worker-jwt
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: worker-jwt
           secret:
@@ -155,6 +157,12 @@ spec:
             items:
               - key: {{ .Values.workerJwt.privateKeyKey }}
                 path: {{ .Values.workerJwt.privateKeyKey }}
+        # securityContext.readOnlyRootFilesystem makes / read-only, so /tmp must
+        # be a writable volume. The admin API stages each uploaded deployment
+        # here while extracting it (see controller.tmpSize).
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.controller.tmpSize }}
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}
