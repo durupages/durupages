@@ -65,8 +65,14 @@ app.kubernetes.io/component: {{ .component }}
 {{ include "durupages.controller.name" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.controller.service.port }}
 {{- end -}}
 
+{{/* The bundle address is used as an HTTP URL prefix by the worker shim, so it
+     MUST carry a scheme. Without one, net/url parses the hostname itself as the
+     scheme and every bundle download fails with "unsupported protocol scheme".
+     In-cluster traffic to the hub Service is plaintext.
+     The sibling addresses above and below are gRPC dial targets, which take a
+     bare host:port and must NOT have a scheme. */}}
 {{- define "durupages.hubBundleAddr" -}}
-{{ include "durupages.hub.name" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.hub.service.httpPort }}
+http://{{ include "durupages.hub.name" . }}.{{ .Release.Namespace }}.svc.{{ .Values.clusterDomain }}:{{ .Values.hub.service.httpPort }}
 {{- end -}}
 
 {{- define "durupages.hubLogAddr" -}}
