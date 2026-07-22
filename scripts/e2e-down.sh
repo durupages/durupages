@@ -14,5 +14,5 @@ echo "==> docker-compose down -v"
 DC down -v --remove-orphans || true
 
 # Remove generated runtime artifacts (keys/kubeconfig/build tar).
-rm -rf "${KUBE_DIR}" "${BUILD_DIR}"
+rm -rf "${KUBE_DIR}" "${BUILD_DIR}" "${CERTS_DIR}"
 echo "==> e2e environment removed"

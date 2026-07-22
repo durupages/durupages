@@ -147,9 +147,6 @@ services:
       - --pages-domain=pages.local
       - --worker-jwt-signing-key=/keys/jwt-priv.pem
       - --controller-addr=172.28.0.10:9440
-      # Advertised to worker pods, not dialled by the controller itself. The
-      # scheme is required: the shim uses this verbatim as a URL prefix.
-      - --hub-advertise-addr=http://172.28.0.11:9080
       - --worker-image=durupages/worker:e2e
       - --worker-namespace=durupages-workers
       - --worker-service-account=default
@@ -157,6 +154,11 @@ services:
       - --default-idle-ttl=10m
     environment:
       - KUBECONFIG=/kube/kubeconfig.yaml
+      # Advertised to worker pods, not dialled by the controller itself. The
+      # scheme is required: the shim uses this verbatim as a URL prefix. It
+      # lives in the environment rather than the command so the TLS overlay can
+      # flip it to https -- compose merges environment but replaces command.
+      - DURUPAGES_HUB_ADVERTISE_ADDR=http://172.28.0.11:9080
     volumes:
       - ./e2e/.keys:/keys:ro
       - ./e2e/.kube:/kube:ro

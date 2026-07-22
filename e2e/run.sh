@@ -182,6 +182,50 @@ echo "  hub bundle activity:"
 docker logs durupages-hub 2>&1 | grep -iE "bundle|GET /|download" | tail -8 | sed 's/^/    /' || true
 
 # ---------------------------------------------------------------------------
+# Scenario 5 (TLS runs only): prove the traffic between components was actually
+# encrypted. Without this the TLS run could pass while silently falling back to
+# plaintext, which is precisely the failure mode it exists to catch.
+# ---------------------------------------------------------------------------
+if [[ "${E2E_TLS}" == "1" ]]; then
+  scenario "5. TLS actually in use between components"
+
+  if docker logs durupages-hub 2>&1 | grep -qE '"msg":"bundle HTTP listening".*"tls":true'; then
+    c_pass "hub bundle listener served TLS"
+  else
+    c_fail "hub bundle listener did not report TLS: $(docker logs durupages-hub 2>&1 | grep -m1 'bundle HTTP listening')"
+  fi
+
+  if docker logs durupages-hub 2>&1 | grep -qE '"msg":"log ingest gRPC listening".*"tls":true'; then
+    c_pass "hub log ingest listener served TLS"
+  else
+    c_fail "hub log ingest listener did not report TLS"
+  fi
+
+  if docker logs durupages-controller 2>&1 | grep -q "tls=true"; then
+    c_pass "controller gRPC served TLS"
+  else
+    c_fail "controller did not report TLS: $(docker logs durupages-controller 2>&1 | grep -m1 'controller listening')"
+  fi
+
+  # The worker is the end that proves it end to end: it was configured to
+  # verify, and the scenarios above only passed because its handshakes with the
+  # controller (registration) and the hub (bundle download) succeeded.
+  WORKER_TLS_LINE=""
+  for p in $(k3s_kubectl get pods -n "${WORKER_NS}" -o name 2>/dev/null); do
+    line="$(k3s_kubectl logs -n "${WORKER_NS}" "${p}" 2>/dev/null | grep -m1 'client TLS configured' || true)"
+    [[ -n "${line}" ]] && WORKER_TLS_LINE="${line}" && break
+  done
+  if [[ -z "${WORKER_TLS_LINE}" ]]; then
+    c_fail "no worker pod reported its TLS configuration; the pod may predate TLS support"
+  elif echo "${WORKER_TLS_LINE}" | grep -q '"controller":true' && echo "${WORKER_TLS_LINE}" | grep -q '"hub":true'; then
+    c_pass "worker verified the controller and the hub over TLS"
+    echo "    ${WORKER_TLS_LINE}"
+  else
+    c_fail "worker ran with TLS off on at least one hop: ${WORKER_TLS_LINE}"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # Result.
 # ---------------------------------------------------------------------------
 if [[ "${FAILED}" -ne 0 ]]; then
