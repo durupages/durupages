@@ -28,7 +28,17 @@ const (
 	// logMsgWorkerError marks a 5xx the worker's own code produced, as opposed
 	// to the shim failing to serve it. The distinction is the whole point: it
 	// says the platform did its job and the page's code did not.
-	logMsgWorkerError  = "shim: worker returned server error"
+	logMsgWorkerError = "shim: worker returned server error"
+	// The control-plane messages below cover the path that decides whether this
+	// pod is usable at all. A pod that cannot reach the controller never
+	// registers, so it is never given a slot, and the only visible symptom is
+	// the router reporting a queue timeout -- a message that points at
+	// capacity when the real cause is here.
+	logMsgControllerDialFailed = "shim: controller connection failed"
+	logMsgRegisterFailed       = "shim: controller registration failed"
+	logMsgHeartbeatFailed      = "shim: controller heartbeat failed"
+	logMsgSelfTerminate        = "shim: self-terminating, controller unreachable"
+
 	logMsgLoadFailed   = "shim: bundle load failed"
 	logMsgLoaded       = "shim: bundle loaded"
 	logMsgAssetsFailed = "shim: assets request failed"

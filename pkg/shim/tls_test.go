@@ -374,3 +374,65 @@ func TestControllerTLSIgnoredWithInjectedClient(t *testing.T) {
 		t.Fatalf("injected client should still be used: %v", err)
 	}
 }
+
+// The failure this logging exists for: with TLS enabled on the controller but
+// the worker unable to complete the handshake, the pod never registers, so it
+// is never given a slot, and the only thing an operator sees is the router
+// reporting "worker slot queue timeout" -- which points at capacity. The cause
+// has to be visible on the worker side.
+func TestControllerRegistrationFailureIsLogged(t *testing.T) {
+	h, _ := newHarness(t, harnessOpts{noStartRun: true})
+
+	// A listener that accepts and immediately closes stands in for any dial
+	// that cannot become a working gRPC session -- a TLS mismatch included.
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lis.Close()
+	go func() {
+		for {
+			c, aerr := lis.Accept()
+			if aerr != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+
+	h.shim.opts.ControllerAddr = lis.Addr().String()
+	h.shim.opts.ControllerTLS = &tls.Config{MinVersion: tls.VersionTLS12}
+
+	conn, err := grpc.NewClient(lis.Addr().String(),
+		grpc.WithTransportCredentials(credentials.NewTLS(h.shim.opts.ControllerTLS)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h.shim.register(ctx, api.NewWorkerServiceClient(conn))
+
+	var found map[string]any
+	for _, l := range h.opsLines() {
+		if l["msg"] == logMsgRegisterFailed {
+			found = l
+		}
+	}
+	if found == nil {
+		t.Fatalf("registration failed silently; nothing explains why the pod never took traffic.\nlines: %v", h.opsLines())
+	}
+	if found["level"] != "ERROR" {
+		t.Errorf("level = %v, want ERROR on the final attempt", found["level"])
+	}
+	if found["tls"] != true {
+		t.Errorf("tls = %v, want true so a handshake problem is distinguishable from a plaintext one", found["tls"])
+	}
+	if found["controllerAddr"] != lis.Addr().String() {
+		t.Errorf("controllerAddr = %v, want the address actually dialled", found["controllerAddr"])
+	}
+	if e, _ := found["error"].(string); e == "" {
+		t.Error("the underlying error was dropped")
+	}
+}

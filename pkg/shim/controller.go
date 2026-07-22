@@ -5,6 +5,7 @@ package shim
 
 import (
 	"context"
+	"log/slog"
 	"sync/atomic"
 	"time"
 
@@ -27,6 +28,10 @@ func (s *Shim) runController(ctx context.Context) {
 	if err != nil {
 		// Without a controller the pod cannot receive drain/renewal signals;
 		// self-terminate so it does not run unmanaged.
+		s.log().Error(logMsgControllerDialFailed,
+			slog.String("controllerAddr", s.opts.ControllerAddr),
+			slog.Bool("tls", s.opts.ControllerTLS != nil),
+			slog.String("error", err.Error()))
 		s.selfTerminate()
 		return
 	}
@@ -46,7 +51,19 @@ func (s *Shim) runController(ctx context.Context) {
 		if firstFail.IsZero() {
 			firstFail = s.now()
 		}
+		s.log().Warn(logMsgHeartbeatFailed,
+			slog.String("controllerAddr", s.opts.ControllerAddr),
+			slog.Bool("tls", s.opts.ControllerTLS != nil),
+			slog.Duration("failingFor", s.now().Sub(firstFail)),
+			slog.String("error", err.Error()))
 		if s.now().Sub(firstFail) >= heartbeatFailWindow {
+			// The pod is about to remove itself. Say so, with the reason: from
+			// the outside this looks like a pod that vanished on its own.
+			s.log().Error(logMsgSelfTerminate,
+				slog.String("controllerAddr", s.opts.ControllerAddr),
+				slog.Bool("tls", s.opts.ControllerTLS != nil),
+				slog.Duration("failingFor", s.now().Sub(firstFail)),
+				slog.String("error", err.Error()))
 			s.selfTerminate()
 			return
 		}
@@ -67,9 +84,22 @@ func (s *Shim) register(ctx context.Context, client api.WorkerServiceClient) {
 		Endpoint: s.ProxyAddr(),
 	}
 	for attempt := 0; attempt < 3 && ctx.Err() == nil; attempt++ {
-		if _, err := client.Register(s.authCtx(ctx), req); err == nil {
+		_, err := client.Register(s.authCtx(ctx), req)
+		if err == nil {
 			return
 		}
+		// The last attempt is the one that decides this pod's fate, so it is
+		// the one worth an error. Earlier ones are warnings: a controller that
+		// is still starting is a normal race, not a fault.
+		level := slog.LevelWarn
+		if attempt == 2 {
+			level = slog.LevelError
+		}
+		s.log().LogAttrs(ctx, level, logMsgRegisterFailed,
+			slog.String("controllerAddr", s.opts.ControllerAddr),
+			slog.Bool("tls", s.opts.ControllerTLS != nil),
+			slog.Int("attempt", attempt+1),
+			slog.String("error", err.Error()))
 		select {
 		case <-ctx.Done():
 			return
