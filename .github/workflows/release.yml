@@ -180,8 +180,13 @@ jobs:
           mkdir -p assets
           for arch in amd64 arm64; do
             tar -C "dist/linux/${arch}" -czf "assets/durupages_${VERSION}_linux_${arch}.tar.gz" .
+            # duru is the standalone client CLI (it deploys to an
+            # already-running stack). It ships as a BARE per-arch executable,
+            # not an archive, so it can be downloaded and run directly:
+            #   curl -Lo duru .../duru_v0.1.2_linux_amd64 && chmod +x duru
+            cp "dist/linux/${arch}/duru" "assets/duru_${VERSION}_linux_${arch}"
           done
-          (cd assets && sha256sum *.tar.gz > SHA256SUMS)
+          (cd assets && sha256sum durupages_*.tar.gz duru_* > SHA256SUMS)
           ls -la assets
 
       - name: Create GitHub Release
@@ -192,4 +197,5 @@ jobs:
           prerelease: ${{ needs.validate.outputs.prerelease == 'true' }}
           files: |
             assets/*.tar.gz
+            assets/duru_*
             assets/SHA256SUMS
