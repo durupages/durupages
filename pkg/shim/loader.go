@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -89,20 +90,47 @@ func (s *Shim) ensureLoaded(ctx context.Context, pageID, deploymentID string) er
 
 // load downloads the bundle and performs a graceful swap that adds the page to
 // the load set. On swap failure the old instance keeps serving.
+//
+// Loading is the slowest and by far the most failure-prone thing the shim does
+// (hub reachability, hub authorization, bundle integrity, controller page
+// config, workerd startup), so both outcomes are logged: success at info with
+// the timings that explain a slow first request, failure at error with the
+// stage that broke. Callers still get the error and log their own response.
 func (s *Shim) load(ctx context.Context, pageID, deploymentID string) error {
+	start := s.now()
+	requestID := requestIDFromContext(ctx)
+	logAttrs := func(extra ...slog.Attr) []slog.Attr {
+		base := []slog.Attr{
+			slog.String("tenantId", s.opts.TenantID),
+			slog.String("pageId", pageID),
+			slog.String("deploymentId", deploymentID),
+		}
+		base = attrIf(base, "requestId", requestID)
+		return append(base, extra...)
+	}
+	fail := func(stage string, err error) error {
+		s.log().LogAttrs(ctx, slog.LevelError, logMsgLoadFailed, logAttrs(
+			slog.String("stage", stage),
+			slog.String("hubAddr", s.opts.HubAddr),
+			slog.Int64("elapsedMs", s.now().Sub(start).Milliseconds()),
+			slog.String("error", err.Error()),
+		)...)
+		return err
+	}
+
 	dep, err := s.fetchBundle(ctx, pageID, deploymentID)
 	if err != nil {
-		return err
+		return fail("fetchBundle", err)
 	}
 	if err := s.fetchPageConfig(ctx, dep); err != nil {
 		_ = os.RemoveAll(dep.dir)
-		return err
+		return fail("fetchPageConfig", err)
 	}
 	s.mu.Lock()
 	s.deployments[deploymentID] = dep
 	s.mu.Unlock()
 
-	return s.swap(ctx, func(cur map[string]string) map[string]string {
+	if err := s.swap(ctx, func(cur map[string]string) map[string]string {
 		cur[pageID] = deploymentID
 		// Load-set shrink applies at swap time: drop other pages that have been
 		// idle beyond MinIdle (their old deployments are cleaned by the sweep).
@@ -115,7 +143,15 @@ func (s *Shim) load(ctx context.Context, pageID, deploymentID string) error {
 			}
 		}
 		return cur
-	})
+	}); err != nil {
+		return fail("swap", err)
+	}
+
+	s.log().LogAttrs(ctx, slog.LevelInfo, logMsgLoaded, logAttrs(
+		slog.Int64("bundleBytes", dep.sizeBytes),
+		slog.Int64("elapsedMs", s.now().Sub(start).Milliseconds()),
+	)...)
+	return nil
 }
 
 // setInFlightFunc is the optional runtime.Instance extension the shim uses to
@@ -211,17 +247,27 @@ func (s *Shim) fetchBundle(ctx context.Context, pageID, deploymentID string) (*d
 		strings.TrimRight(s.opts.HubAddr, "/"), s.opts.TenantID, pageID, deploymentID)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("shim: fetch bundle %s: %w", url, err)
 	}
+	// The bearer is the worker JWT; it is never echoed into an error or a log.
 	req.Header.Set("Authorization", "Bearer "+s.currentJWT())
+	// Carry the request id across the last hop so the hub's log line for this
+	// fetch joins the router's and the shim's under one id. Without it the
+	// correlation chain breaks exactly where it is needed most: a 502 whose
+	// real cause is the hub answering 401 or 404.
+	if rid := requestIDFromContext(ctx); rid != "" {
+		req.Header.Set(api.HeaderRequestID, rid)
+	}
 
 	resp, err := s.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("shim: fetch bundle: %w", err)
+		// Carry the URL: "which hub did we even talk to" is the first question
+		// asked when a page starts answering 502 load failed.
+		return nil, fmt.Errorf("shim: fetch bundle %s: %w", url, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("shim: fetch bundle: status %d", resp.StatusCode)
+		return nil, fmt.Errorf("shim: fetch bundle %s: status %d%s", url, resp.StatusCode, errBodySuffix(resp.Body))
 	}
 
 	dir := filepath.Join(s.opts.BundleDir, deploymentID)
@@ -235,7 +281,7 @@ func (s *Shim) fetchBundle(ctx context.Context, pageID, deploymentID string) (*d
 	size, err := untar(resp.Body, dir)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, err
+		return nil, fmt.Errorf("shim: unpack bundle %s: %w", url, err)
 	}
 
 	dep := &deployment{
@@ -251,6 +297,26 @@ func (s *Shim) fetchBundle(ctx context.Context, pageID, deploymentID string) (*d
 		return nil, err
 	}
 	return dep, nil
+}
+
+// maxErrBodySnippet caps how much of a hub error body is quoted back into the
+// wrapping error.
+const maxErrBodySnippet = 256
+
+// errBodySuffix reads a short, whitespace-collapsed snippet of an error
+// response body so that a hub rejection ("page not found", "token expired")
+// says why, not just "status 404". It returns "" when the body is empty. Only
+// hub error bodies reach this: they carry no tenant data or credentials.
+func errBodySuffix(body io.Reader) string {
+	b, err := io.ReadAll(io.LimitReader(body, maxErrBodySnippet))
+	if err != nil {
+		return ""
+	}
+	snippet := strings.Join(strings.Fields(string(b)), " ")
+	if snippet == "" {
+		return ""
+	}
+	return ": " + snippet
 }
 
 // fetchPageConfig asks the controller for the page's Env/Secret bindings and

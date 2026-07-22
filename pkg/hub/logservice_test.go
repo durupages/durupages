@@ -8,8 +8,11 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log/slog"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 
@@ -70,6 +73,11 @@ func newIngestClient(t *testing.T, opts Options) (api.LogServiceClient, *recordi
 	t.Helper()
 	sink := &recordingSink{}
 	opts.Sink = sink
+	if opts.Logger == nil {
+		// These tests deliberately feed malformed events and a failing sink;
+		// keep their (expected) log lines out of the test output.
+		opts.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
+	}
 	h, err := New(opts)
 	if err != nil {
 		t.Fatal(err)
@@ -299,6 +307,65 @@ func TestIngestSinkErrorStillAcks(t *testing.T) {
 		t.Fatalf("ack = %d, want 99 despite sink error", ack.GetBatchId())
 	}
 	_ = stream.CloseSend()
+}
+
+// TestIngestFailuresAreLogged covers the two ways ingest loses data quietly: a
+// producer shipping an undecodable event, and a sink rejecting a batch that was
+// already acked. Both used to vanish into an unstructured log.Printf.
+func TestIngestFailuresAreLogged(t *testing.T) {
+	logs := &logCapture{}
+	opts := optionsWithKey(t)
+	opts.Logger = logs.logger()
+	client, sink, cleanup := newIngestClient(t, opts)
+	defer cleanup()
+	sink.mu.Lock()
+	sink.failReq = true
+	sink.mu.Unlock()
+
+	stream, err := client.Ingest(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	good := usage.RequestUsage{RequestID: "good"}
+	batch := &api.IngestBatch{
+		BatchId:          42,
+		RequestUsageJson: [][]byte{[]byte("{not json"), mustJSON(t, good)},
+	}
+	if err := stream.Send(batch); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Recv(); err != nil {
+		t.Fatal(err)
+	}
+	_ = stream.CloseSend()
+
+	var sawMalformed, sawSinkError bool
+	for _, rec := range logs.records(t) {
+		switch rec["msg"] {
+		case "hub skipped malformed usage event":
+			sawMalformed = true
+			if rec["level"] != "WARN" || fmt.Sprint(rec["batchId"]) != "42" || rec["event"] != "request_usage" {
+				t.Errorf("malformed-event line = %v", rec)
+			}
+			if _, ok := rec["error"]; !ok {
+				t.Errorf("malformed-event line carries no error: %v", rec)
+			}
+		case "hub log sink write failed":
+			sawSinkError = true
+			if rec["level"] != "ERROR" || fmt.Sprint(rec["batchId"]) != "42" || fmt.Sprint(rec["events"]) != "1" {
+				t.Errorf("sink-error line = %v", rec)
+			}
+			if errText, _ := rec["error"].(string); !strings.Contains(errText, "sink boom") {
+				t.Errorf("sink-error line = %v, want the sink's error", rec)
+			}
+		}
+	}
+	if !sawMalformed {
+		t.Errorf("no malformed-event line in:\n%s", logs.raw())
+	}
+	if !sawSinkError {
+		t.Errorf("no sink-error line in:\n%s", logs.raw())
+	}
 }
 
 func TestIngestMultipleBatches(t *testing.T) {

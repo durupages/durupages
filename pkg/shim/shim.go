@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -73,7 +74,24 @@ type Options struct {
 	// When nil the shim runs in pod-log mode and writes JSON lines to LogWriter.
 	LogClient api.LogServiceClient
 	// LogWriter receives pod-log JSON lines (default os.Stdout).
+	//
+	// LogWriter is the *tenant-facing* log: one JSON usage event per request,
+	// including the worker's own console output. It is not the shim's own
+	// operational log — that is Logger below, and the two must not be mixed.
 	LogWriter io.Writer
+
+	// Logger receives the shim's own structured operational lines: the cause of
+	// every 4xx/5xx it returns (warn for 4xx, error for 5xx) and one info line
+	// per successful bundle load. It never carries worker output; that is
+	// LogWriter's job.
+	//
+	// When nil the slog.Default() logger is resolved at the time of logging, so
+	// a slog.SetDefault performed after New still takes effect. Defaulting to
+	// slog.Default() rather than to "logging disabled" is deliberate: an
+	// embedder that wires nothing at all still gets its 502 causes recorded,
+	// which is exactly the operational gap this package used to have. Tests
+	// that must stay quiet pass an explicit logger over io.Discard.
+	Logger *slog.Logger
 
 	// Now is the clock (default time.Now); tests inject a fake clock.
 	Now func() time.Time
@@ -101,6 +119,10 @@ type Shim struct {
 	cacheMax   int64
 	sweepEvery time.Duration
 	httpClient *http.Client
+
+	// logger may be nil, meaning "resolve slog.Default() per log call" so that a
+	// later slog.SetDefault still takes effect (see (*Shim).log).
+	logger *slog.Logger
 
 	proxyLn, assetsLn, tailLn, healthLn net.Listener
 	assetsEndpoint, tailEndpoint        string
@@ -160,6 +182,7 @@ func New(opts Options) (*Shim, error) {
 		cacheMax:    opts.CacheMaxBytes,
 		sweepEvery:  opts.SweepInterval,
 		httpClient:  opts.HTTPClient,
+		logger:      opts.Logger,
 		deployments: map[string]*deployment{},
 		active:      map[string]string{},
 		loading:     map[string]*loadCall{},
@@ -243,8 +266,10 @@ func (s *Shim) Run(ctx context.Context) error {
 		go func(srv *http.Server, ln net.Listener) {
 			defer wg.Done()
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				// Serving errors are logged to the pod log; nothing to recover.
-				fmt.Fprintf(os.Stderr, "[shim] server error: %v\n", err)
+				// Serving errors are fatal for that listener; nothing to recover.
+				s.log().Error("shim: http server stopped",
+					slog.String("addr", ln.Addr().String()),
+					slog.String("error", err.Error()))
 			}
 		}(srv, sv.ln)
 	}

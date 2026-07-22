@@ -7,6 +7,17 @@
 // assembled by a thin main; alternative log sinks and storage backends plug in
 // through the exported interfaces.
 //
+// # Observability
+//
+// The bundle API emits exactly one log/slog line per request on Options.Logger
+// (slog.Default() when unset), at info level for 2xx/3xx, warn for 4xx and
+// error for 5xx. Failures carry the server-side cause as "error" plus a stable
+// "reason" (why a worker JWT was rejected, which storage key was missing, what
+// the blob store returned), so that a worker stuck on "load failed" is
+// diagnosable from the hub's own log. Response bodies stay opaque: detail goes
+// to the log, never to the client. Tokens, secret values and the Authorization
+// header are never logged.
+//
 // See docs/ARCHITECTURE.md sections 7 and 9.
 package hub
 
@@ -14,6 +25,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"log/slog"
 
 	"github.com/durupages/durupages/pkg/storage"
 	"github.com/durupages/durupages/pkg/usage"
@@ -55,6 +67,25 @@ type Options struct {
 	// MaxLogBytesPerRequest caps log message bytes per event; <= 0 selects the
 	// default.
 	MaxLogBytesPerRequest int
+	// Logger receives the hub's own operational log: one structured line per
+	// bundle request (method, path, status, bytes, durationMs, tenantId,
+	// pageId, deploymentId, requestId) carrying, on a failure, the storage key
+	// that was looked up and the server-side cause as "error" plus a stable
+	// "reason". Ingest-side faults (malformed events, sink errors, broken
+	// streams) land here too.
+	//
+	// This is NOT the worker log pipeline: log events shipped by shims and the
+	// router go to Sink (see LogSink), never here. Logger is about the hub
+	// itself, so that a worker failing to load a bundle is diagnosable from the
+	// hub's own log instead of only from the shim's "load failed".
+	//
+	// When nil the slog.Default() logger is used, resolved at the time of
+	// logging so that a later slog.SetDefault is still honoured. Defaulting to
+	// the process logger rather than to "logging disabled" is deliberate: an
+	// embedder that wires nothing still gets its 4xx/5xx causes recorded, which
+	// is exactly the operational gap this package used to have. Tests that must
+	// stay quiet pass an explicit logger over io.Discard.
+	Logger *slog.Logger
 }
 
 // Hub is the assembled hub. It is safe for concurrent use.
@@ -65,6 +96,20 @@ type Hub struct {
 	sink                  LogSink
 	maxLogsPerRequest     int
 	maxLogBytesPerRequest int
+
+	// logger may be nil, meaning "resolve slog.Default() per log call" so that a
+	// later slog.SetDefault still takes effect. slog loggers are safe for
+	// concurrent use, so no mutex is needed here.
+	logger *slog.Logger
+}
+
+// log returns the logger to use: the configured one, or the process default
+// resolved late so that a slog.SetDefault after New is still honoured.
+func (h *Hub) log() *slog.Logger {
+	if h.logger != nil {
+		return h.logger
+	}
+	return slog.Default()
 }
 
 // New validates opts and returns a Hub.
@@ -81,6 +126,7 @@ func New(opts Options) (*Hub, error) {
 		sink:                  opts.Sink,
 		maxLogsPerRequest:     opts.MaxLogsPerRequest,
 		maxLogBytesPerRequest: opts.MaxLogBytesPerRequest,
+		logger:                opts.Logger,
 	}
 	if h.maxLogsPerRequest <= 0 {
 		h.maxLogsPerRequest = DefaultMaxLogsPerRequest

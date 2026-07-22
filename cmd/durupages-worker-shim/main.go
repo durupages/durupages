@@ -14,6 +14,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -29,6 +30,20 @@ import (
 	"github.com/durupages/durupages/pkg/runtime/workerdruntime"
 	"github.com/durupages/durupages/pkg/shim"
 )
+
+// setupLogging installs the process-wide structured logger on stderr, matching
+// durupages-controller so every component emits the same JSON shape. Setting it
+// as the slog default also routes the standard log package (used for the
+// startup fatals below) through the same handler, and lets any shim internals
+// that fall back to slog.Default() land here.
+//
+// stderr, not stdout: stdout is the tenant-facing pod log (usage events as JSON
+// lines), and the shim's own operational logs must not be mixed into it.
+func setupLogging() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -85,6 +100,7 @@ func proxyAdvertiseAddr() string {
 
 func main() {
 	version.MaybePrint()
+	setupLogging()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -130,7 +146,11 @@ func main() {
 		MinIdle:       envDuration("DURUPAGES_BUNDLE_MIN_IDLE", time.Hour),
 		CacheMaxBytes: envInt64("DURUPAGES_BUNDLE_CACHE_MAX_BYTES", 2<<30),
 		SweepInterval: envDuration("DURUPAGES_BUNDLE_SWEEP_INTERVAL", 5*time.Minute),
-		LogWriter:     os.Stdout,
+		// LogWriter is the tenant-facing pod log (usage events) on stdout;
+		// Logger is the shim's own operational log on stderr. Two different
+		// streams on purpose.
+		LogWriter: os.Stdout,
+		Logger:    slog.Default(),
 	}
 
 	// Log ingest is enabled when the controller propagates the hub's log

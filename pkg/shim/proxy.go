@@ -5,6 +5,7 @@ package shim
 
 import (
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync/atomic"
@@ -28,55 +29,90 @@ var eventHeaderAllow = map[string]bool{
 // target deployment, forwards to the current runtime instance and emits a
 // RequestUsage event.
 func (s *Shim) serveProxy(w http.ResponseWriter, r *http.Request) {
+	// Before the lease is verified the only correlation id available is the one
+	// the router put on the wire; after verification the lease claim wins.
 	if s.isDraining() {
-		http.Error(w, "draining", http.StatusServiceUnavailable)
+		s.httpError(w, r, http.StatusServiceUnavailable, "draining", logMsgProxyRejected,
+			attrIf(nil, "requestId", requestIDOf(r))...)
 		return
 	}
 
 	leaseTok := r.Header.Get(api.HeaderLease)
 	if leaseTok == "" {
-		http.Error(w, "missing lease", http.StatusUnauthorized)
+		s.httpError(w, r, http.StatusUnauthorized, "missing lease", logMsgProxyRejected,
+			attrIf([]slog.Attr{slog.String("reason", "no "+api.HeaderLease+" header")},
+				"requestId", requestIDOf(r))...)
 		return
 	}
+	// Never log leaseTok itself: it is a bearer credential. Only the verifier's
+	// reason string is safe to record.
 	claims, err := workerauth.VerifyLease(s.opts.LeasePubKey, leaseTok)
 	if err != nil {
-		http.Error(w, "invalid lease", http.StatusForbidden)
+		s.httpError(w, r, http.StatusForbidden, "invalid lease", logMsgProxyRejected,
+			attrIf([]slog.Attr{slog.String("error", err.Error())},
+				"requestId", requestIDOf(r))...)
 		return
 	}
 	if claims.TenantID != s.opts.TenantID {
-		http.Error(w, "tenant mismatch", http.StatusForbidden)
+		s.httpError(w, r, http.StatusForbidden, "tenant mismatch", logMsgProxyRejected,
+			slog.String("requestId", claims.RequestID),
+			slog.String("tenantId", s.opts.TenantID),
+			slog.String("leaseTenantId", claims.TenantID),
+			slog.String("pageId", claims.PageID))
 		return
 	}
 	if hp := r.Header.Get(api.HeaderPage); hp != claims.PageID {
-		http.Error(w, "page mismatch", http.StatusForbidden)
+		s.httpError(w, r, http.StatusForbidden, "page mismatch", logMsgProxyRejected,
+			slog.String("requestId", claims.RequestID),
+			slog.String("tenantId", claims.TenantID),
+			slog.String("pageId", claims.PageID),
+			slog.String("headerPageId", hp))
 		return
 	}
 
 	pageID := claims.PageID
+	requestID := claims.RequestID
 	deploymentID := r.Header.Get(api.HeaderDeployment)
 	if deploymentID == "" {
-		http.Error(w, "missing deployment", http.StatusBadRequest)
+		s.httpError(w, r, http.StatusBadRequest, "missing deployment", logMsgProxyRejected,
+			slog.String("requestId", requestID),
+			slog.String("tenantId", claims.TenantID),
+			slog.String("pageId", pageID),
+			slog.String("reason", "no "+api.HeaderDeployment+" header"))
 		return
 	}
 
-	if err := s.ensureLoaded(r.Context(), pageID, deploymentID); err != nil {
-		http.Error(w, "load failed", http.StatusBadGateway)
+	// Tag the context so the bundle load path can stamp the same requestId on
+	// its own log lines (the load is where the interesting failures live).
+	ctx := withRequestID(r.Context(), requestID)
+	if err := s.ensureLoaded(ctx, pageID, deploymentID); err != nil {
+		s.httpError(w, r, http.StatusBadGateway, "load failed", logMsgLoadFailed,
+			slog.String("requestId", requestID),
+			slog.String("tenantId", claims.TenantID),
+			slog.String("pageId", pageID),
+			slog.String("deploymentId", deploymentID),
+			slog.String("hubAddr", s.opts.HubAddr),
+			slog.String("error", err.Error()))
 		return
 	}
 	li := s.current.Load()
 	if li == nil {
-		http.Error(w, "no instance", http.StatusServiceUnavailable)
+		s.httpError(w, r, http.StatusServiceUnavailable, "no instance", logMsgProxyFailed,
+			slog.String("requestId", requestID),
+			slog.String("tenantId", claims.TenantID),
+			slog.String("pageId", pageID),
+			slog.String("deploymentId", deploymentID),
+			slog.String("reason", "no runtime instance after load"))
 		return
 	}
 
-	requestID := claims.RequestID
 	s.cor.expect(requestID)
 
 	atomic.AddInt64(&li.inFlight, 1)
 	defer atomic.AddInt64(&li.inFlight, -1)
 
 	start := s.now()
-	status := s.forward(w, r, li.inst.Endpoint(), pageID, requestID)
+	status := s.forward(w, r, li.inst.Endpoint(), pageID, requestID, deploymentID, claims.TenantID)
 	wall := s.now().Sub(start)
 
 	s.touch(deploymentID)
@@ -86,7 +122,7 @@ func (s *Shim) serveProxy(w http.ResponseWriter, r *http.Request) {
 // forward proxies r to the runtime instance at endpoint, injecting the trusted
 // page and request-id headers and stripping the lease. It returns the upstream
 // status (or 502 on transport failure).
-func (s *Shim) forward(w http.ResponseWriter, r *http.Request, endpoint, pageID, requestID string) int {
+func (s *Shim) forward(w http.ResponseWriter, r *http.Request, endpoint, pageID, requestID, deploymentID, tenantID string) int {
 	out := r.Clone(r.Context())
 	out.URL.Scheme = "http"
 	out.URL.Host = endpoint
@@ -101,7 +137,15 @@ func (s *Shim) forward(w http.ResponseWriter, r *http.Request, endpoint, pageID,
 
 	resp, err := s.transport.RoundTrip(out)
 	if err != nil {
-		http.Error(w, "bad gateway", http.StatusBadGateway)
+		// The runtime instance is up but did not answer: workerd crashed,
+		// closed the connection or timed out mid-request.
+		s.httpError(w, r, http.StatusBadGateway, "bad gateway", logMsgProxyFailed,
+			slog.String("requestId", requestID),
+			slog.String("tenantId", tenantID),
+			slog.String("pageId", pageID),
+			slog.String("deploymentId", deploymentID),
+			slog.String("endpoint", endpoint),
+			slog.String("error", err.Error()))
 		return http.StatusBadGateway
 	}
 	defer resp.Body.Close()

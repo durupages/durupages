@@ -11,6 +11,21 @@
 // The router is a library so operators can assemble a custom binary; all of its
 // collaborators (controller RPC client, storage, static cache, log client) are
 // injected through Options.
+//
+// # Two independent logs
+//
+// The router writes two log streams that must not be confused:
+//
+//   - The OPERATIONAL log (Options.Logger, a log/slog logger, defaulting to
+//     slog.Default()). Every 4xx/5xx response records its cause here — failed
+//     host resolution, a missing manifest, a lost controller lease, a worker
+//     that answered 5xx, an unreadable static asset — together with the request
+//     context (host, path, page attribution and, on the worker route, the lease
+//     request ID that is also echoed to the client in X-DuruPages-Request-Id).
+//     One access line per request is emitted at debug level. See oplog.go.
+//   - The USAGE log (Options.LogClient / Options.LogWriter). These are the
+//     per-request StaticAccess records the hub aggregates for billing and for
+//     the customer-visible log stream. See log.go.
 package router
 
 import (
@@ -18,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -51,10 +67,30 @@ type Options struct {
 	PagesDomain string
 	// LogClient, when set, receives StaticAccess events via LogService.Ingest.
 	// When nil the router runs in pod-log mode and writes JSON lines instead.
+	//
+	// This is the USAGE log (per-request billing/customer-visible records), not
+	// the router's own operational log: see Logger.
 	LogClient api.LogServiceClient
 	// LogWriter receives pod-log JSON lines when LogClient is nil. Defaults to
 	// os.Stdout.
+	//
+	// Like LogClient this carries the USAGE log only. It is unrelated to Logger
+	// and the two must not be pointed at each other: an operator parsing the
+	// pod-log stream expects one StaticAccess JSON object per line and nothing
+	// else.
 	LogWriter io.Writer
+	// Logger receives the router's OPERATIONAL log: the cause behind every
+	// 4xx/5xx response (at warn/error), plus one access line per request (at
+	// debug). When nil the slog.Default() logger is used at the time of
+	// logging, so a slog.SetDefault after New is still honoured.
+	//
+	// Defaulting to slog.Default() rather than to "logging disabled" is
+	// deliberate, and matches pkg/adminapi: an embedder that wires nothing at
+	// all still gets its 502 causes recorded, which is exactly the operational
+	// gap this package used to have — an opaque "502 bad gateway" reached the
+	// client while the server side stayed silent. Tests that must stay quiet
+	// pass an explicit logger over io.Discard.
+	Logger *slog.Logger
 	// Now overrides the clock (for tests). Defaults to time.Now.
 	Now func() time.Time
 }
@@ -79,7 +115,14 @@ type Router struct {
 
 	resolveCache *resolveCache
 	manifests    *manifestCache
-	logger       *accessLogger
+
+	// usageLog ships StaticAccess records (billing / customer log stream).
+	usageLog *usageLogger
+	// logger is the operational log/slog logger. It may be nil, meaning
+	// "resolve slog.Default() per log line" so that a later slog.SetDefault
+	// still takes effect. slog loggers are safe for concurrent use, so no
+	// mutex is needed here.
+	logger *slog.Logger
 }
 
 // errUnknownHost is returned internally when the controller does not know the
@@ -115,7 +158,8 @@ func New(opts Options) (*Router, error) {
 		now:          now,
 		resolveCache: newResolveCache(),
 		manifests:    newManifestCache(manifestCacheSize),
-		logger:       newAccessLogger(opts.LogClient, writer, now),
+		usageLog:     newUsageLogger(opts.LogClient, writer, now),
+		logger:       opts.Logger,
 	}
 	return rt, nil
 }
@@ -123,45 +167,76 @@ func New(opts Options) (*Router, error) {
 // Close releases background resources (the LogService batching goroutine). It
 // is safe to call multiple times.
 func (rt *Router) Close() error {
-	rt.logger.close()
+	rt.usageLog.close()
 	return nil
 }
 
 // ServeHTTP implements the request pipeline of docs/ARCHITECTURE.md 3.1.
+//
+// Every early return below responds with a fixed, deliberately terse body (the
+// wire contract clients depend on) and records the actual cause on the
+// operational log instead.
 func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// (a) Strip inbound internal headers so external callers cannot spoof the
 	// worker routing/lease headers, and determine the host.
 	stripInternalHeaders(r.Header)
 	host := hostOnly(r.Host)
 
+	rl := &reqLog{host: host, start: rt.now()}
+	rec := &respRecorder{ResponseWriter: w, status: http.StatusOK}
+	w = rec
+	defer func() { rt.logAccess(r, rec, rl) }()
+
 	// (b) Resolve host -> page.
 	page, err := rt.resolve(r.Context(), host)
 	if err != nil {
 		if errors.Is(err, errUnknownHost) {
+			// Warn, not info: reaching the data plane with a host it cannot map
+			// is normally a DNS/custom-domain misconfiguration worth surfacing.
+			// It is also what internet background noise aimed at the bare
+			// address produces, hence one line and no stack of detail.
+			rt.logEvent(r, rl, slog.LevelWarn, msgUnknownHost,
+				slog.Int("status", http.StatusNotFound))
 			http.Error(w, "404 page not found", http.StatusNotFound)
 			return
 		}
+		rt.logEvent(r, rl, slog.LevelError, msgResolveFailed,
+			slog.Int("status", http.StatusBadGateway),
+			slog.String("grpcCode", status.Code(err).String()),
+			slog.Any("error", err))
 		http.Error(w, "502 bad gateway", http.StatusBadGateway)
 		return
 	}
+	rl.page = page
 
 	// (c) Load the deployment manifest.
 	m, err := rt.loadManifest(r.Context(), page)
 	if err != nil {
 		if errors.Is(err, storage.ErrNotFound) {
+			// A 4xx status, but a server-side fault: the page record points at
+			// an active deployment whose manifest is not in storage. The
+			// storage key rides along inside the wrapped error.
+			rt.logEvent(r, rl, slog.LevelWarn, msgManifestMissing,
+				slog.Int("status", http.StatusNotFound),
+				slog.Any("error", err))
 			http.Error(w, "404 page not found", http.StatusNotFound)
 			return
 		}
+		rt.logEvent(r, rl, slog.LevelError, msgManifestFailed,
+			slog.Int("status", http.StatusBadGateway),
+			slog.Any("error", err))
 		http.Error(w, "502 bad gateway", http.StatusBadGateway)
 		return
 	}
 
 	// (d) Pipeline decision: worker or static.
 	if m.HasWorker && pagesspec.MatchRoutes(m.Routes, r.URL.Path) {
-		rt.serveDynamic(w, r, page, m)
+		rl.route = routeDynamic
+		rt.serveDynamic(w, r, rl, page, m)
 		return
 	}
-	rt.serveStatic(w, r, host, page, m)
+	rl.route = routeStatic
+	rt.serveStatic(w, r, rl, host, page, m)
 }
 
 // resolve maps host to a PageInfo, using the in-memory TTL cache first.
@@ -197,12 +272,14 @@ func (rt *Router) loadManifest(ctx context.Context, page *api.PageInfo) (*manife
 	key := fmt.Sprintf(storage.ManifestKeyFmt, page.GetTenantId(), page.GetPageId(), dep)
 	rc, _, err := rt.storage.Get(ctx, key)
 	if err != nil {
-		return nil, err
+		// Wrapped so the operational log names the object that was missing or
+		// unreadable; errors.Is(storage.ErrNotFound) still matches.
+		return nil, fmt.Errorf("get %s: %w", key, err)
 	}
 	defer rc.Close()
 	m, err := manifest.Decode(rc)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("decode %s: %w", key, err)
 	}
 	rt.manifests.add(dep, m)
 	return m, nil

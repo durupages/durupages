@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -54,22 +55,30 @@ type traceRecord struct {
 // keys each record by the X-DuruPages-Request-Id header injected on the request
 // and hands the derived RequestTrace to the correlator for the proxy to pick up.
 func (s *Shim) serveCollector(w http.ResponseWriter, r *http.Request) {
+	// The tail worker's payload carries worker console output, so nothing from
+	// the body is ever logged here — only its size and the parse error.
 	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		s.httpError(w, r, http.StatusMethodNotAllowed, "method not allowed", logMsgTailRejected,
+			slog.String("method", r.Method))
 		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxTailBody+1))
 	if err != nil {
-		http.Error(w, "read error", http.StatusBadRequest)
+		s.httpError(w, r, http.StatusBadRequest, "read error", logMsgTailRejected,
+			slog.String("error", err.Error()))
 		return
 	}
 	if len(body) > maxTailBody {
-		http.Error(w, "body too large", http.StatusRequestEntityTooLarge)
+		s.httpError(w, r, http.StatusRequestEntityTooLarge, "body too large", logMsgTailRejected,
+			slog.Int("bytes", len(body)),
+			slog.Int("limitBytes", maxTailBody))
 		return
 	}
 	var records []traceRecord
 	if err := json.Unmarshal(body, &records); err != nil {
-		http.Error(w, "bad json", http.StatusBadRequest)
+		s.httpError(w, r, http.StatusBadRequest, "bad json", logMsgTailRejected,
+			slog.Int("bytes", len(body)),
+			slog.String("error", err.Error()))
 		return
 	}
 	for i := range records {

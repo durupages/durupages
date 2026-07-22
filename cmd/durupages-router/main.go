@@ -10,6 +10,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -79,9 +80,37 @@ func (s schemeFixStream) Recv() (*api.AcquireSlotEvent, error) {
 	return ev, nil
 }
 
+// setupLogging installs a JSON slog handler on stderr as the process default,
+// at the requested level. This mirrors durupages-controller: one JSON stream on
+// stderr for the whole binary.
+//
+// slog.SetDefault also redirects the standard log package through this handler,
+// so the log.Printf/log.Fatalf calls in this file end up in the same stream
+// instead of a second, differently formatted one.
+//
+// The level is the access-log switch: pkg/router logs the cause of every
+// 4xx/5xx at warn/error (visible at the default info level) and one access line
+// per request at debug, so "debug" turns on full access logging for the data
+// plane and "info" keeps it to failures only.
+func setupLogging(level string) {
+	lvl := slog.LevelInfo
+	bad := false
+	if level != "" && lvl.UnmarshalText([]byte(level)) != nil {
+		// Not fatal: an unparsable level must not keep the data plane down.
+		lvl, bad = slog.LevelInfo, true
+	}
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: lvl,
+	})))
+	if bad {
+		slog.Warn("unknown log level, defaulting to info", "value", level)
+	}
+}
+
 func main() {
 	version.MaybePrint()
 	var (
+		logLevel        = flag.String("log-level", envOr("DURUPAGES_LOG_LEVEL", "info"), "operational log level: debug, info, warn or error (debug enables the per-request access log)")
 		listen          = flag.String("listen", envOr("DURUPAGES_LISTEN", ":8080"), "HTTP listen address")
 		controllerAddr  = flag.String("controller-addr", envOr("DURUPAGES_CONTROLLER_ADDR", ""), "controller gRPC address (required)")
 		hubLogAddr      = flag.String("hub-log-addr", envOr("DURUPAGES_HUB_LOG_ADDR", ""), "hub log ingest gRPC address (empty = pod-log mode)")
@@ -98,6 +127,7 @@ func main() {
 		s3PathStyle = flag.Bool("s3-path-style", envOr("DURUPAGES_S3_PATH_STYLE", "true") == "true", "path-style S3 addressing")
 	)
 	flag.Parse()
+	setupLogging(*logLevel)
 	if *controllerAddr == "" || *s3Bucket == "" {
 		log.Fatal("durupages-router: --controller-addr and --s3-bucket are required")
 	}
@@ -130,7 +160,13 @@ func main() {
 		Cache:           cache,
 		ResolveCacheTTL: *resolveCacheTTL,
 		PagesDomain:     *pagesDomain,
-		LogWriter:       os.Stdout,
+		// Usage log (StaticAccess records): stdout, one JSON object per line,
+		// which is what the pod-log collector parses.
+		LogWriter: os.Stdout,
+		// Operational log: the same stderr JSON stream as the rest of the
+		// binary. Distinct from LogWriter above on purpose — mixing the two
+		// would corrupt the usage stream.
+		Logger: slog.Default().With("component", "router"),
 	}
 	if *hubLogAddr != "" {
 		logConn, err := grpc.NewClient(*hubLogAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))

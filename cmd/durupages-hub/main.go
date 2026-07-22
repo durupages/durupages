@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -43,8 +44,24 @@ func envOrInt64(key string, def int64) int64 {
 	return def
 }
 
+// setupLogging installs a JSON slog handler on stderr as the process default.
+//
+// slog.SetDefault also redirects the standard log package through this handler,
+// so the log.Printf calls in this binary and the hub's structured request lines
+// end up in one consistent JSON stream instead of two competing formats.
+//
+// stderr, not stdout: stdout carries the usage/log event stream written by the
+// default stdout sink, and mixing the hub's own operational log into it would
+// corrupt that feed for whatever consumes it.
+func setupLogging() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+}
+
 func main() {
 	version.MaybePrint()
+	setupLogging()
 	var (
 		listenHTTP    = flag.String("listen-http", envOr("DURUPAGES_LISTEN_HTTP", ":9080"), "bundle HTTP listen address")
 		listenGRPC    = flag.String("listen-grpc", envOr("DURUPAGES_LISTEN_GRPC", ":9443"), "log ingest gRPC listen address")
@@ -114,6 +131,7 @@ func run(ctx context.Context, cfg config) error {
 		Sink:                  stdoutsink.New(os.Stdout),
 		MaxLogsPerRequest:     cfg.maxLogs,
 		MaxLogBytesPerRequest: cfg.maxLogBytes,
+		Logger:                slog.Default().With("component", "hub"),
 	})
 	if err != nil {
 		return fmt.Errorf("hub: %w", err)

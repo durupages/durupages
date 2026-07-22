@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"time"
 
 	"google.golang.org/grpc"
@@ -42,6 +42,11 @@ func (s *logServer) Ingest(stream api.LogService_IngestServer) error {
 			return nil
 		}
 		if err != nil {
+			// A producer that dies mid-stream (pod eviction, network drop)
+			// silently stopped shipping usage; without this the gap in the
+			// usage record has no explanation anywhere.
+			s.h.log().LogAttrs(ctx, slog.LevelWarn, "hub log ingest stream failed",
+				slog.String("op", "recv"), slog.String("error", err.Error()))
 			return err
 		}
 		s.h.processBatch(ctx, batch)
@@ -52,6 +57,9 @@ func (s *logServer) Ingest(stream api.LogService_IngestServer) error {
 		// outage. A sink error therefore drops at most the events already
 		// buffered here, which is preferable to head-of-line blocking.
 		if err := stream.Send(&api.IngestAck{BatchId: batch.GetBatchId()}); err != nil {
+			s.h.log().LogAttrs(ctx, slog.LevelWarn, "hub log ingest stream failed",
+				slog.String("op", "ack"), slog.Int64("batchId", batch.GetBatchId()),
+				slog.String("error", err.Error()))
 			return err
 		}
 	}
@@ -59,12 +67,19 @@ func (s *logServer) Ingest(stream api.LogService_IngestServer) error {
 
 // processBatch decodes, caps and forwards one batch. Malformed events are
 // skipped without failing the whole batch.
+// Event payloads are never logged: a request_usage event carries request URLs
+// and worker console output, so only the decode error and the batch it came
+// from are recorded.
 func (h *Hub) processBatch(ctx context.Context, batch *api.IngestBatch) {
+	logger := h.log()
+	batchID := slog.Int64("batchId", batch.GetBatchId())
+
 	reqs := make([]usage.RequestUsage, 0, len(batch.GetRequestUsageJson()))
 	for _, raw := range batch.GetRequestUsageJson() {
 		var ru usage.RequestUsage
 		if err := json.Unmarshal(raw, &ru); err != nil {
-			log.Printf("hub: skipping malformed request_usage event: %v", err)
+			logger.LogAttrs(ctx, slog.LevelWarn, "hub skipped malformed usage event",
+				slog.String("event", "request_usage"), batchID, slog.String("error", err.Error()))
 			continue
 		}
 		ru.Logs = h.capLogs(ru.Logs)
@@ -74,7 +89,8 @@ func (h *Hub) processBatch(ctx context.Context, batch *api.IngestBatch) {
 	for _, raw := range batch.GetStaticAccessJson() {
 		var sa usage.StaticAccess
 		if err := json.Unmarshal(raw, &sa); err != nil {
-			log.Printf("hub: skipping malformed static_access event: %v", err)
+			logger.LogAttrs(ctx, slog.LevelWarn, "hub skipped malformed usage event",
+				slog.String("event", "static_access"), batchID, slog.String("error", err.Error()))
 			continue
 		}
 		statics = append(statics, sa)
@@ -83,14 +99,21 @@ func (h *Hub) processBatch(ctx context.Context, batch *api.IngestBatch) {
 	if h.sink == nil {
 		return
 	}
+	// The batch is acked regardless (see Ingest), so a sink error means these
+	// events are gone: it is a data-loss event, not a retryable one, and is
+	// logged at error level with the number of events dropped.
 	if len(reqs) > 0 {
 		if err := h.sink.WriteRequestUsage(ctx, reqs); err != nil {
-			log.Printf("hub: sink WriteRequestUsage: %v", err)
+			logger.LogAttrs(ctx, slog.LevelError, "hub log sink write failed",
+				slog.String("event", "request_usage"), batchID,
+				slog.Int("events", len(reqs)), slog.String("error", err.Error()))
 		}
 	}
 	if len(statics) > 0 {
 		if err := h.sink.WriteStaticAccess(ctx, statics); err != nil {
-			log.Printf("hub: sink WriteStaticAccess: %v", err)
+			logger.LogAttrs(ctx, slog.LevelError, "hub log sink write failed",
+				slog.String("event", "static_access"), batchID,
+				slog.Int("events", len(statics)), slog.String("error", err.Error()))
 		}
 	}
 }

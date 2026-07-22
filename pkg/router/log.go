@@ -24,11 +24,20 @@ const (
 	maxBufferedEvents = 10000
 )
 
+// This file implements the USAGE log: the per-request StaticAccess records the
+// hub aggregates for billing and for the customer-visible log stream, shipped
+// over Options.LogClient or written as pod-log JSON lines to Options.LogWriter.
+//
+// It is NOT the router's operational log. Diagnostics about the router itself
+// (why a request produced a 502, access lines) go to Options.Logger and live in
+// oplog.go. Keep the two apart: this stream's consumers parse it as one
+// StaticAccess JSON object per line.
+
 // logStatic builds and emits a StaticAccess event for one static response.
 // Sensitive request headers (Authorization/Cookie/...) are omitted: only a
 // small allowlist (host, user-agent, referer) is recorded.
 func (rt *Router) logStatic(r *http.Request, host string, page *api.PageInfo, status int, bytesSent int64) {
-	rt.logger.emit(usage.StaticAccess{
+	rt.usageLog.emit(usage.StaticAccess{
 		TenantID:     page.GetTenantId(),
 		PageID:       page.GetPageId(),
 		DeploymentID: page.GetActiveDeploymentId(),
@@ -67,9 +76,9 @@ func allowlistHeaders(r *http.Request, host string) map[string]string {
 	return h
 }
 
-// accessLogger emits StaticAccess events either to a LogService.Ingest stream
+// usageLogger emits StaticAccess events either to a LogService.Ingest stream
 // (batched) or, in pod-log mode, as JSON lines to a writer.
-type accessLogger struct {
+type usageLogger struct {
 	now func() time.Time
 
 	// pod-log mode.
@@ -80,8 +89,8 @@ type accessLogger struct {
 	g *grpcLogger
 }
 
-func newAccessLogger(client api.LogServiceClient, w io.Writer, now func() time.Time) *accessLogger {
-	l := &accessLogger{now: now, w: w}
+func newUsageLogger(client api.LogServiceClient, w io.Writer, now func() time.Time) *usageLogger {
+	l := &usageLogger{now: now, w: w}
 	if client != nil {
 		l.g = newGRPCLogger(client)
 	}
@@ -94,7 +103,7 @@ type podLogLine struct {
 	usage.StaticAccess
 }
 
-func (l *accessLogger) emit(ev usage.StaticAccess) {
+func (l *usageLogger) emit(ev usage.StaticAccess) {
 	if l.g != nil {
 		l.g.emit(ev)
 		return
@@ -109,7 +118,7 @@ func (l *accessLogger) emit(ev usage.StaticAccess) {
 	l.mu.Unlock()
 }
 
-func (l *accessLogger) close() {
+func (l *usageLogger) close() {
 	if l.g != nil {
 		l.g.close()
 	}
