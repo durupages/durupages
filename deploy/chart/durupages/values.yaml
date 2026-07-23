@@ -228,7 +228,7 @@ worker:
   # -- Worker image (shim + durupages-workerd) the controller stamps onto pods.
   image:
     repository: ghcr.io/durupages/durupages-worker
-    tag: ""            # defaults to .Chart.AppVersion
+    tag: "worker-v1.20260721.1-duru6"
     # -- Pin an exact image by digest ("sha256:..."). Takes precedence
     #    over tag, which is a moving pointer the registry can repoint.
     digest: ""
