@@ -49,11 +49,13 @@ type KubePodsOptions struct {
 	// DefaultCPULimit / DefaultMemLimit apply when a PodSpec omits its own.
 	DefaultCPULimit string
 	DefaultMemLimit string
-	// CommonAnnotations are cluster-wide annotations stamped on every worker
-	// pod, whatever the tenant (see LoadWorkerAnnotationsFile). Empty disables
-	// the feature. Validated by NewKubePods, since bad keys here would fail
-	// every pod creation instead of one.
-	CommonAnnotations map[string]string
+	// CommonPodOverrides is cluster-wide worker pod configuration -- node
+	// selector, tolerations, affinity, DNS, priority, plus metadata -- applied
+	// to every worker pod regardless of tenant (see LoadWorkerPodOverridesFile).
+	// The zero value disables the feature. Its metadata fields are validated by
+	// NewKubePods, since a bad key here would fail every pod creation instead
+	// of one.
+	CommonPodOverrides WorkerPodOverrides
 }
 
 // kubePods is the Kubernetes PodManager: it creates bare pods (no
@@ -75,7 +77,7 @@ func NewKubePods(opts KubePodsOptions) (*kubePods, error) {
 	if opts.Image == "" {
 		return nil, errors.New("controller: KubePods Image is required")
 	}
-	if err := validateWorkerAnnotations(opts.CommonAnnotations); err != nil {
+	if err := validateWorkerPodOverrides(opts.CommonPodOverrides); err != nil {
 		return nil, err
 	}
 	return &kubePods{opts: opts}, nil
@@ -85,12 +87,15 @@ func NewKubePods(opts KubePodsOptions) (*kubePods, error) {
 // are validated (system prefixes rejected) then merged so the system labels
 // always win.
 //
-// Annotation precedence is tenant first, cluster-wide second: where the two
-// name the same key, the operator's value stands. The cluster-wide set is a
+// Annotation/label precedence is tenant first, cluster-wide second: where the
+// two name the same key, the operator's value stands. The cluster-wide set is a
 // platform policy — scrape targets, mesh injection, chargeback — declared once
 // for every worker pod in the cluster, and a policy a tenant can opt out of by
-// naming the same key in its own PodAnnotations is not a policy. Tenants keep
-// every key the operator has not claimed.
+// naming the same key in its own PodAnnotations/PodLabels is not a policy.
+// Tenants keep every key the operator has not claimed. The rest of
+// CommonPodOverrides (node selector, tolerations, affinity, DNS, priority) has
+// no tenant-level equivalent to merge with -- it is cluster-wide only, applied
+// as given.
 func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 	if err := validateNoSystemKeys(spec.Labels); err != nil {
 		return err
@@ -98,13 +103,14 @@ func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 	if err := validateNoSystemKeys(spec.Annotations); err != nil {
 		return err
 	}
+	ov := k.opts.CommonPodOverrides
 
-	labels := mergeMap(spec.Labels, map[string]string{
+	labels := mergeMap(mergeMap(spec.Labels, ov.Labels), map[string]string{
 		labelAppName:    appNameWorker,
 		labelTenantID:   spec.TenantID,
 		labelGeneration: k.opts.Generation,
 	})
-	annotations := mergeMap(spec.Annotations, k.opts.CommonAnnotations)
+	annotations := mergeMap(spec.Annotations, ov.Annotations)
 
 	resources, err := k.resourceRequirements(spec)
 	if err != nil {
@@ -128,6 +134,14 @@ func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 				RunAsNonRoot:   &trueVal,
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
+			NodeSelector:              ov.NodeSelector,
+			Tolerations:               ov.Tolerations,
+			Affinity:                  ov.Affinity,
+			TopologySpreadConstraints: ov.TopologySpreadConstraints,
+			DNSPolicy:                 ov.DNSPolicy,
+			DNSConfig:                 ov.DNSConfig,
+			PriorityClassName:         ov.PriorityClassName,
+			RuntimeClassName:          ov.RuntimeClassName,
 			Volumes: []corev1.Volume{{
 				Name:         bundlesVolumeName,
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},

@@ -85,35 +85,51 @@ func TestParseConfigAdvertiseEnv(t *testing.T) {
 	}
 }
 
-// TestParseConfigWorkerAnnotationsFile covers both spellings of the
-// cluster-wide worker annotation source, and its "disabled" default.
-func TestParseConfigWorkerAnnotationsFile(t *testing.T) {
+// TestParseConfigWorkerPodOverridesFile covers both spellings of the
+// cluster-wide worker pod overrides source, and its "disabled" default.
+func TestParseConfigWorkerPodOverridesFile(t *testing.T) {
 	cfg, err := parseConfig(requiredArgs(), noEnv)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
-	if cfg.workerAnnotationsFile != "" {
-		t.Fatalf("workerAnnotationsFile = %q, want empty by default", cfg.workerAnnotationsFile)
+	if cfg.workerPodOverridesFile != "" {
+		t.Fatalf("workerPodOverridesFile = %q, want empty by default", cfg.workerPodOverridesFile)
 	}
 
-	const path = "/etc/durupages/worker-annotations/annotations.yaml"
-	cfg, err = parseConfig(requiredArgs("--worker-annotations-file="+path), noEnv)
+	const path = "/etc/durupages/worker-pod-overrides/pod-overrides.yaml"
+	cfg, err = parseConfig(requiredArgs("--worker-pod-overrides-file="+path), noEnv)
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
-	if cfg.workerAnnotationsFile != path {
-		t.Fatalf("workerAnnotationsFile = %q, want %q", cfg.workerAnnotationsFile, path)
+	if cfg.workerPodOverridesFile != path {
+		t.Fatalf("workerPodOverridesFile = %q, want %q", cfg.workerPodOverridesFile, path)
 	}
 
 	cfg, err = parseConfig(requiredArgs(), envMap(map[string]string{
-		"DURUPAGES_PG_DSN":                  "postgres://localhost/durupages",
-		"DURUPAGES_WORKER_ANNOTATIONS_FILE": path,
+		"DURUPAGES_PG_DSN":                    "postgres://localhost/durupages",
+		"DURUPAGES_WORKER_POD_OVERRIDES_FILE": path,
 	}))
 	if err != nil {
 		t.Fatalf("parseConfig: %v", err)
 	}
-	if cfg.workerAnnotationsFile != path {
-		t.Fatalf("workerAnnotationsFile from env = %q, want %q", cfg.workerAnnotationsFile, path)
+	if cfg.workerPodOverridesFile != path {
+		t.Fatalf("workerPodOverridesFile from env = %q, want %q", cfg.workerPodOverridesFile, path)
+	}
+}
+
+// TestParseConfigRejectsRenamedWorkerAnnotationsFile checks the old
+// annotations-only env is reported with an explanation of the new shape,
+// rather than being silently ignored.
+func TestParseConfigRejectsRenamedWorkerAnnotationsFile(t *testing.T) {
+	_, err := parseConfig(requiredArgs(), envMap(map[string]string{
+		"DURUPAGES_WORKER_ANNOTATIONS_FILE": "/etc/durupages/worker-annotations/annotations.yaml",
+	}))
+	if err == nil {
+		t.Fatal("DURUPAGES_WORKER_ANNOTATIONS_FILE accepted, want an error")
+	}
+	if !strings.Contains(err.Error(), "DURUPAGES_WORKER_ANNOTATIONS_FILE") ||
+		!strings.Contains(err.Error(), "DURUPAGES_WORKER_POD_OVERRIDES_FILE") {
+		t.Fatalf("unhelpful error: %v", err)
 	}
 }
 

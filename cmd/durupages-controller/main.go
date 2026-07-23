@@ -112,9 +112,10 @@ type config struct {
 	workerSA        string
 	workerCPULimit  string
 	workerMemLimit  string
-	// workerAnnotationsFile holds cluster-wide worker pod annotations as a YAML
-	// string map. Empty = no common annotations.
-	workerAnnotationsFile string
+	// workerPodOverridesFile holds cluster-wide worker pod configuration (node
+	// selector, tolerations, affinity, DNS, priority, annotations, labels) as a
+	// controller.WorkerPodOverrides-shaped YAML file. Empty = none.
+	workerPodOverridesFile string
 
 	defaults       controller.Defaults
 	bundleMinIdle  string
@@ -211,8 +212,10 @@ func parseConfig(args []string, env getenv) (config, error) {
 		workerMemLimit  = fs.String("worker-mem-limit", envOr(env, "DURUPAGES_WORKER_MEM_LIMIT", "512Mi"), "default worker pod memory limit")
 		// Read once at startup: the file is a mounted ConfigMap whose change
 		// restarts this pod anyway.
-		workerAnnotationsFile = fs.String("worker-annotations-file", envOr(env, "DURUPAGES_WORKER_ANNOTATIONS_FILE", ""),
-			"YAML file of annotations (string map) applied to every worker pod; these win over a tenant's own PodAnnotations (empty = none)")
+		workerPodOverridesFile = fs.String("worker-pod-overrides-file", envOr(env, "DURUPAGES_WORKER_POD_OVERRIDES_FILE", ""),
+			"YAML file (controller.WorkerPodOverrides shape: nodeSelector, tolerations, affinity, dnsPolicy, dnsConfig, "+
+				"priorityClassName, runtimeClassName, annotations, labels) applied to every worker pod; "+
+				"annotations/labels win over a tenant's own PodAnnotations/PodLabels (empty = none)")
 
 		defQueueTimeout   = fs.Duration("default-queue-timeout", 30*time.Second, "default per-page queue timeout")
 		maxQueueTimeout   = fs.Duration("max-queue-timeout", 120*time.Second, "max per-page queue timeout")
@@ -246,6 +249,17 @@ func parseConfig(args []string, env getenv) (config, error) {
 			return config{}, fmt.Errorf("%s is no longer read by the controller: rename it to %s "+
 				"(%s remains the name injected into worker pods)", r.old, r.new, r.old)
 		}
+	}
+	// The annotations-only file was generalized into the broader
+	// WorkerPodOverrides shape (node selector, tolerations, affinity, DNS,
+	// priority, plus annotations/labels), not just renamed, so the message
+	// says so rather than reusing the "advertise" wording above -- there is no
+	// worker-facing env of this name to point to.
+	if env("DURUPAGES_WORKER_ANNOTATIONS_FILE") != "" {
+		return config{}, fmt.Errorf("DURUPAGES_WORKER_ANNOTATIONS_FILE is no longer read by the controller: " +
+			"its flat annotations-only format was replaced by DURUPAGES_WORKER_POD_OVERRIDES_FILE, " +
+			"a YAML file also accepting nodeSelector/tolerations/affinity/dnsPolicy/dnsConfig/" +
+			"priorityClassName/runtimeClassName/labels")
 	}
 
 	// Whether the controller serves TLS to workers is nearly always "yes if it
@@ -289,7 +303,7 @@ func parseConfig(args []string, env getenv) (config, error) {
 		hubLogAdvertiseSNI:      *hubLogAdvertiseSNI,
 		kubeconfig:              *kubeconfig, workerNamespace: *workerNamespace, workerImage: *workerImage,
 		workerSA: *workerSA, workerCPULimit: *workerCPULimit, workerMemLimit: *workerMemLimit,
-		workerAnnotationsFile: *workerAnnotationsFile,
+		workerPodOverridesFile: *workerPodOverridesFile,
 		defaults: controller.Defaults{
 			QueueTimeout: *defQueueTimeout, MaxQueueTimeout: *maxQueueTimeout,
 			RequestTimeout: *defRequestTimeout, MaxConcurrency: *defMaxConcurrency,
@@ -377,16 +391,16 @@ func run(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("kubernetes client: %w", err)
 	}
-	// An unreadable or malformed annotations file is an operator mistake, and
+	// An unreadable or malformed overrides file is an operator mistake, and
 	// refusing to start says so far more clearly than worker pods that come up
-	// without the annotations the operator declared.
-	var commonAnnotations map[string]string
-	if cfg.workerAnnotationsFile != "" {
-		if commonAnnotations, err = controller.LoadWorkerAnnotationsFile(cfg.workerAnnotationsFile); err != nil {
+	// without the configuration the operator declared.
+	var podOverrides controller.WorkerPodOverrides
+	if cfg.workerPodOverridesFile != "" {
+		if podOverrides, err = controller.LoadWorkerPodOverridesFile(cfg.workerPodOverridesFile); err != nil {
 			return err
 		}
-		log.Printf("worker annotations: %d common annotation(s) from %s",
-			len(commonAnnotations), cfg.workerAnnotationsFile)
+		log.Printf("worker pod overrides: loaded from %s (%d annotation(s), %d label(s), %d toleration(s))",
+			cfg.workerPodOverridesFile, len(podOverrides.Annotations), len(podOverrides.Labels), len(podOverrides.Tolerations))
 	}
 
 	pods, err := controller.NewKubePods(controller.KubePodsOptions{
@@ -397,7 +411,7 @@ func run(cfg config) error {
 		Generation:         fmt.Sprintf("g%d", time.Now().Unix()),
 		DefaultCPULimit:    cfg.workerCPULimit,
 		DefaultMemLimit:    cfg.workerMemLimit,
-		CommonAnnotations:  commonAnnotations,
+		CommonPodOverrides: podOverrides,
 	})
 	if err != nil {
 		return fmt.Errorf("kubepods: %w", err)

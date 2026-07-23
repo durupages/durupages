@@ -70,11 +70,11 @@ spec:
         {{- with .Values.controller.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
       annotations:
         checksum/worker-jwt: {{ include "durupages.workerJwtSecretName" . | sha256sum }}
-        {{- if .Values.worker.podAnnotations }}
+        {{- if .Values.worker.podOverrides }}
         # Content, not name: the ConfigMap's name never changes, so hashing it
-        # would never roll the controller and an edited annotation set would sit
+        # would never roll the controller and an edited override set would sit
         # unread until something else restarted the pod.
-        checksum/worker-annotations: {{ include "durupages.workerAnnotationsYAML" . | sha256sum }}
+        checksum/worker-pod-overrides: {{ include "durupages.workerPodOverridesYAML" . | sha256sum }}
         {{- end }}
         {{- with .Values.controller.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
     spec:
@@ -96,8 +96,8 @@ spec:
             - --max-concurrency-per-pod={{ .Values.controller.maxConcurrencyPerPod }}
             - --target-concurrency-per-pod={{ .Values.controller.targetConcurrencyPerPod }}
             - --default-idle-ttl={{ .Values.controller.defaultIdleTTL }}
-            {{- if .Values.worker.podAnnotations }}
-            - --worker-annotations-file={{ include "durupages.workerAnnotationsFile" . }}
+            {{- if .Values.worker.podOverrides }}
+            - --worker-pod-overrides-file={{ include "durupages.workerPodOverridesFile" . }}
             {{- end }}
             {{- with .Values.controller.extraArgs }}
             {{- toYaml . | nindent 12 }}
@@ -209,9 +209,9 @@ spec:
               readOnly: true
             - name: tmp
               mountPath: /tmp
-            {{- if .Values.worker.podAnnotations }}
-            - name: worker-annotations
-              mountPath: {{ include "durupages.workerAnnotationsDir" . }}
+            {{- if .Values.worker.podOverrides }}
+            - name: worker-pod-overrides
+              mountPath: {{ include "durupages.workerPodOverridesDir" . }}
               readOnly: true
             {{- end }}
             {{- if .Values.tls.enabled }}
@@ -236,10 +236,10 @@ spec:
             items:
               - key: {{ .Values.workerJwt.privateKeyKey }}
                 path: {{ .Values.workerJwt.privateKeyKey }}
-        {{- if .Values.worker.podAnnotations }}
-        - name: worker-annotations
+        {{- if .Values.worker.podOverrides }}
+        - name: worker-pod-overrides
           configMap:
-            name: {{ include "durupages.workerAnnotationsName" . }}
+            name: {{ include "durupages.workerPodOverridesName" . }}
         {{- end }}
         {{- if .Values.tls.enabled }}
         {{- include "durupages.tls.certVolume" (dict

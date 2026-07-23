@@ -240,23 +240,40 @@ worker:
   bundleMinIdle: ""
   # -- Worker bundle disk cache cap propagated to worker pods (empty = shim default 2GiB).
   bundleCacheMaxBytes: ""
-  # -- Annotations applied to EVERY worker pod the controller creates.
+  # -- Cluster-wide configuration applied to EVERY worker pod the controller
+  #    creates, whatever the tenant. See "Worker pod overrides" in the chart
+  #    README for the full field reference and examples (nodeSelector,
+  #    tolerations, affinity, dnsPolicy, dnsConfig, priorityClassName,
+  #    runtimeClassName, annotations, labels).
   #
   #    Worker pods are created at runtime by the controller, not by this chart,
-  #    so these cannot be templated onto them directly. The chart stores them in
-  #    a ConfigMap, the controller reads it at startup, and a change to it
-  #    restarts the controller (its checksum is on the pod template) so the next
-  #    pods pick the new set up. Existing worker pods are not rewritten.
+  #    so these cannot be templated onto them directly. The chart stores this
+  #    object in a ConfigMap, the controller reads it at startup, and a change
+  #    to it restarts the controller (its checksum is on the pod template) so
+  #    the next pods pick the new configuration up. Existing worker pods are
+  #    not rewritten.
   #
-  #    These are the operator's platform policy: on a key collision they win
-  #    over a tenant's own pod annotations. Keys under durupages.io/ are
-  #    reserved and rejected.
+  #    annotations/labels are the operator's platform policy: on a key
+  #    collision they win over a tenant's own PodAnnotations/PodLabels. Keys
+  #    under durupages.io/ are reserved and rejected. The container, volumes,
+  #    security context, service account and restart policy are NOT
+  #    overridable here -- only placement/scheduling and metadata.
   #
-  #    podAnnotations:
-  #      prometheus.io/scrape: "true"
-  #      prometheus.io/port: "9090"
-  #      example.com/cost-center: platform
-  podAnnotations: {}
+  #    podOverrides:
+  #      nodeSelector:
+  #        workload: durupages-worker
+  #      tolerations:
+  #        - key: durupages.io/dedicated
+  #          operator: Equal
+  #          value: "true"
+  #          effect: NoSchedule
+  #      dnsConfig:
+  #        nameservers: ["10.0.0.10"]
+  #      annotations:
+  #        prometheus.io/scrape: "true"
+  #      labels:
+  #        cost-center: platform
+  podOverrides: {}
 
 # NetworkPolicy applied in the worker namespace (see ARCHITECTURE section 8).
 # Toggle off if your CNI does not enforce NetworkPolicy.

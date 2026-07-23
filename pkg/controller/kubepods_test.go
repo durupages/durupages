@@ -30,22 +30,29 @@ func newKubePodsForTest(t *testing.T) (*kubePods, *fake.Clientset) {
 	return kp, cs
 }
 
-// newKubePodsWithCommonAnnotations is newKubePodsForTest plus the cluster-wide
-// annotation set.
-func newKubePodsWithCommonAnnotations(t *testing.T, common map[string]string) (*kubePods, *fake.Clientset) {
+// newKubePodsWithOverrides is newKubePodsForTest plus cluster-wide
+// WorkerPodOverrides.
+func newKubePodsWithOverrides(t *testing.T, ov WorkerPodOverrides) (*kubePods, *fake.Clientset) {
 	t.Helper()
 	cs := fake.NewSimpleClientset()
 	kp, err := NewKubePods(KubePodsOptions{
-		Client:            cs,
-		Namespace:         "durupages-workers",
-		Image:             "durupages/worker:latest",
-		Generation:        "gen-abc123",
-		CommonAnnotations: common,
+		Client:             cs,
+		Namespace:          "durupages-workers",
+		Image:              "durupages/worker:latest",
+		Generation:         "gen-abc123",
+		CommonPodOverrides: ov,
 	})
 	if err != nil {
 		t.Fatalf("NewKubePods: %v", err)
 	}
 	return kp, cs
+}
+
+// newKubePodsWithCommonAnnotations is newKubePodsWithOverrides for the
+// annotations-only case, which most of the older tests below exercise.
+func newKubePodsWithCommonAnnotations(t *testing.T, common map[string]string) (*kubePods, *fake.Clientset) {
+	t.Helper()
+	return newKubePodsWithOverrides(t, WorkerPodOverrides{Annotations: common})
 }
 
 // createdPod creates spec and returns the resulting pod.
@@ -133,6 +140,100 @@ func TestKubePodsCommonAnnotationsLeaveSystemLabelsAlone(t *testing.T) {
 	}
 }
 
+// TestKubePodsCommonLabelsWinOverTenant mirrors the annotation precedence test
+// for labels: the operator's cluster-wide set wins on collision, and the
+// system labels reconcile relies on remain untouched by either.
+func TestKubePodsCommonLabelsWinOverTenant(t *testing.T) {
+	kp, cs := newKubePodsWithOverrides(t, WorkerPodOverrides{
+		Labels: map[string]string{"team": "platform", "cost-center": "infra"},
+	})
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Labels: map[string]string{"team": "acme-web", "app": "blog"},
+	})
+	if pod.Labels["team"] != "platform" {
+		t.Fatalf("tenant overrode a common label: %v", pod.Labels)
+	}
+	if pod.Labels["cost-center"] != "infra" || pod.Labels["app"] != "blog" {
+		t.Fatalf("labels merged wrong: %v", pod.Labels)
+	}
+	if pod.Labels[labelAppName] != appNameWorker || pod.Labels[labelTenantID] != "acme" {
+		t.Fatalf("system labels disturbed: %v", pod.Labels)
+	}
+}
+
+// TestKubePodsCommonPodOverridesApplyScheduling checks that the
+// scheduling/placement fields -- which have no tenant-level equivalent to
+// merge with -- land on the pod spec verbatim.
+func TestKubePodsCommonPodOverridesApplyScheduling(t *testing.T) {
+	rc := "gvisor"
+	ov := WorkerPodOverrides{
+		NodeSelector: map[string]string{"workload": "durupages-worker"},
+		Tolerations: []corev1.Toleration{{
+			Key: "durupages.io/dedicated", Operator: corev1.TolerationOpEqual,
+			Value: "true", Effect: corev1.TaintEffectNoSchedule,
+		}},
+		Affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key: "kubernetes.io/arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"},
+						}},
+					}},
+				},
+			},
+		},
+		DNSPolicy:         corev1.DNSNone,
+		DNSConfig:         &corev1.PodDNSConfig{Nameservers: []string{"10.0.0.10"}},
+		PriorityClassName: "high-priority",
+		RuntimeClassName:  &rc,
+	}
+	kp, cs := newKubePodsWithOverrides(t, ov)
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+
+	if pod.Spec.NodeSelector["workload"] != "durupages-worker" {
+		t.Fatalf("nodeSelector missing: %v", pod.Spec.NodeSelector)
+	}
+	if len(pod.Spec.Tolerations) != 1 || pod.Spec.Tolerations[0].Key != "durupages.io/dedicated" {
+		t.Fatalf("tolerations missing: %v", pod.Spec.Tolerations)
+	}
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		t.Fatalf("affinity missing: %v", pod.Spec.Affinity)
+	}
+	if pod.Spec.DNSPolicy != corev1.DNSNone || pod.Spec.DNSConfig == nil ||
+		len(pod.Spec.DNSConfig.Nameservers) != 1 || pod.Spec.DNSConfig.Nameservers[0] != "10.0.0.10" {
+		t.Fatalf("dns config wrong: policy=%v config=%v", pod.Spec.DNSPolicy, pod.Spec.DNSConfig)
+	}
+	if pod.Spec.PriorityClassName != "high-priority" {
+		t.Fatalf("priorityClassName missing: %v", pod.Spec.PriorityClassName)
+	}
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+		t.Fatalf("runtimeClassName missing: %v", pod.Spec.RuntimeClassName)
+	}
+}
+
+// TestKubePodsCommonPodOverridesLeaveCoreSpecAlone guards the allowlist: no
+// combination of overrides may reach the container, volumes, security
+// context, service account or restart policy the controller itself sets --
+// those are what keeps every worker pod fungible and isolated.
+func TestKubePodsCommonPodOverridesLeaveCoreSpecAlone(t *testing.T) {
+	kp, cs := newKubePodsWithOverrides(t, WorkerPodOverrides{
+		NodeSelector: map[string]string{"workload": "durupages-worker"},
+	})
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("RestartPolicy = %v", pod.Spec.RestartPolicy)
+	}
+	if len(pod.Spec.Containers) != 1 || pod.Spec.Containers[0].Name != workerContainerName {
+		t.Fatalf("containers disturbed: %v", pod.Spec.Containers)
+	}
+	if pod.Spec.SecurityContext == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
+		t.Fatalf("pod security context disturbed: %v", pod.Spec.SecurityContext)
+	}
+}
+
 // TestNewKubePodsRejectsBadCommonAnnotations checks the validation also guards
 // callers that build the map themselves rather than reading the file.
 func TestNewKubePodsRejectsBadCommonAnnotations(t *testing.T) {
@@ -142,10 +243,10 @@ func TestNewKubePodsRejectsBadCommonAnnotations(t *testing.T) {
 		{"app.kubernetes.io/name": "spoof"},
 	} {
 		_, err := NewKubePods(KubePodsOptions{
-			Client:            fake.NewSimpleClientset(),
-			Namespace:         "durupages-workers",
-			Image:             "durupages/worker:latest",
-			CommonAnnotations: common,
+			Client:             fake.NewSimpleClientset(),
+			Namespace:          "durupages-workers",
+			Image:              "durupages/worker:latest",
+			CommonPodOverrides: WorkerPodOverrides{Annotations: common},
 		})
 		if err == nil {
 			t.Fatalf("NewKubePods accepted %v", common)

@@ -233,6 +233,46 @@ the pod environment, so **already running worker pods keep the CA they were born
 with** — during a CA change the bundle must hold both the old and the new CA
 until those pods are replaced.
 
+## Worker pod overrides
+
+Worker pods are created at runtime by the controller, not by this chart, so
+placement/scheduling fields (`nodeSelector`, `tolerations`, `affinity`, `dns*`,
+`priorityClassName`, `runtimeClassName`) and cluster-wide `annotations`/`labels`
+cannot be templated onto them directly. Setting `worker.podOverrides` instead
+writes them into a ConfigMap the controller reads at startup and applies to
+every worker pod it creates, whatever the tenant:
+
+```yaml
+worker:
+  podOverrides:
+    nodeSelector:
+      workload: durupages-worker
+    tolerations:
+      - key: durupages.io/dedicated
+        operator: Equal
+        value: "true"
+        effect: NoSchedule
+    dnsConfig:
+      nameservers: ["10.0.0.10"]
+    priorityClassName: high-priority
+    annotations:
+      prometheus.io/scrape: "true"
+    labels:
+      cost-center: platform
+```
+
+Each field's shape matches the corresponding Kubernetes `PodSpec` field
+exactly, so anything valid there is valid here. `annotations`/`labels` are a
+platform policy: on a key collision they win over a tenant's own
+`PodAnnotations`/`PodLabels`, and keys under `durupages.io/` are reserved. The
+container, volumes, security context, service account and restart policy are
+**not** overridable through this mechanism — only placement/scheduling and
+metadata.
+
+Changing `worker.podOverrides` rolls the controller (its checksum is on the
+controller's own pod template); the new configuration applies to worker pods
+created after that roll, not to ones already running.
+
 ## What gets installed
 
 | Kind | Name | Notes |
@@ -248,6 +288,7 @@ until those pods are replaced.
 | ServiceAccount | `durupages-worker-noperm` | in the worker namespace, `automountServiceAccountToken: false` |
 | Role + RoleBinding | `<release>-worker-pods` | controller may get/list/watch/create/delete pods in the worker namespace |
 | NetworkPolicy | `<release>-worker` | default-deny; see below. Toggle with `networkPolicy.enabled` |
+| ConfigMap | `<release>-worker-pod-overrides` | only when `worker.podOverrides` is non-empty |
 | Secret | `<release>-worker-jwt` | unless `workerJwt.existingSecret` |
 | Secret | `<release>-postgres` | unless `postgres.existingSecret` |
 | Secret | `<release>-s3` | only when inline S3 creds are given |
@@ -309,7 +350,7 @@ policy with `networkPolicy.enabled=false` where the CNI has no enforcement.
 | `<component>.image.digest` | `""` | Pin an exact image (`sha256:…`); wins over `.tag`. Applies to `controller`, `router`, `hub`, `worker` |
 | `worker.bundleMinIdle` | `""` | `DURUPAGES_BUNDLE_MIN_IDLE` propagated to workers |
 | `worker.bundleCacheMaxBytes` | `""` | `DURUPAGES_BUNDLE_CACHE_MAX_BYTES` propagated to workers |
-| `worker.podAnnotations` | `{}` | Annotations put on **every** worker pod — see [Worker pod annotations](#worker-pod-annotations) |
+| `worker.podOverrides` | `{}` | Cluster-wide scheduling/metadata for **every** worker pod — see [Worker pod overrides](#worker-pod-overrides) |
 | `networkPolicy.enabled` | `true` | Toggle the worker NetworkPolicy |
 | `networkPolicy.clusterCIDRs` | RFC1918 blocks | CIDRs excluded from worker external egress |
 | `pagesDomain` | `pages.local` | Pages domain, shared by router and controller |

@@ -128,45 +128,39 @@ app.kubernetes.io/component: {{ .component }}
 {{- end -}}
 
 {{/* ============================================================ *
- * Worker pod annotations
+ * Worker pod overrides
  * ============================================================ *
- * The chart cannot annotate worker pods directly -- the controller creates
- * them at runtime -- so they are carried in a ConfigMap the controller reads.
- * Name, key, mount path and content live here so the ConfigMap and the
- * controller Deployment that mounts and checksums it cannot disagree. */}}
+ * The chart cannot configure worker pods directly -- the controller creates
+ * them at runtime -- so worker.podOverrides is carried in a ConfigMap the
+ * controller reads at startup instead. Name, key, mount path and content live
+ * here so the ConfigMap and the controller Deployment that mounts and
+ * checksums it cannot disagree.
+ *
+ * The payload is worker.podOverrides dumped as-is: its shape is defined and
+ * validated on the Go side (controller.WorkerPodOverrides), not here, so this
+ * chart does not need to track that allowlist. */}}
 
-{{- define "durupages.workerAnnotationsName" -}}
-{{ include "durupages.fullname" . }}-worker-annotations
+{{- define "durupages.workerPodOverridesName" -}}
+{{ include "durupages.fullname" . }}-worker-pod-overrides
 {{- end -}}
 
-{{- define "durupages.workerAnnotationsKey" -}}
-annotations.yaml
+{{- define "durupages.workerPodOverridesKey" -}}
+pod-overrides.yaml
 {{- end -}}
 
-{{- define "durupages.workerAnnotationsDir" -}}
-/etc/durupages/worker-annotations
+{{- define "durupages.workerPodOverridesDir" -}}
+/etc/durupages/worker-pod-overrides
 {{- end -}}
 
-{{- define "durupages.workerAnnotationsFile" -}}
-{{ include "durupages.workerAnnotationsDir" . }}/{{ include "durupages.workerAnnotationsKey" . }}
+{{- define "durupages.workerPodOverridesFile" -}}
+{{ include "durupages.workerPodOverridesDir" . }}/{{ include "durupages.workerPodOverridesKey" . }}
 {{- end -}}
 
 {{/* The ConfigMap payload. Also hashed into the controller's pod template: the
      checksum has to cover the CONTENT, since the ConfigMap's name never
-     changes and hashing that would never trigger a restart.
-
-     Values are forced to strings. Kubernetes annotations are string-valued, but
-     YAML happily reads an unquoted `prometheus.io/scrape: true` as a boolean
-     and `port: 9090` as an integer, which the controller -- decoding into
-     map[string]string -- would reject at startup. Since there is only one
-     possible intent here, write "true" rather than making the operator
-     rediscover the quoting rule. */}}
-{{- define "durupages.workerAnnotationsYAML" -}}
-{{- $strings := dict -}}
-{{- range $key, $value := .Values.worker.podAnnotations -}}
-{{- $_ := set $strings $key (toString $value) -}}
-{{- end -}}
-{{ toYaml $strings }}
+     changes and hashing that would never trigger a restart. */}}
+{{- define "durupages.workerPodOverridesYAML" -}}
+{{ toYaml .Values.worker.podOverrides }}
 {{- end -}}
 
 {{/* ============================================================ *
