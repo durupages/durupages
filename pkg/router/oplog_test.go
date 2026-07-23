@@ -4,6 +4,7 @@
 package router
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -195,6 +196,88 @@ func TestUnknownHostLogged(t *testing.T) {
 	}
 	if e.Host != "nope.example.com" || e.Path != "/x" || e.Status != http.StatusNotFound {
 		t.Fatalf("entry = %+v", e)
+	}
+}
+
+// A flood of bogus, client-controlled Host headers must not amplify into one
+// synchronous warning per request. With the harness's frozen clock every
+// request after the first falls inside the rate-limit window, so exactly one
+// unknown-host line is emitted no matter how many requests arrive -- while
+// every request still gets its 404.
+func TestUnknownHostWarningRateLimited(t *testing.T) {
+	ctrl := &fakeController{pages: map[string]pageResolve{}}
+	h := newHarness(t, ctrl, nil)
+
+	const n = 50
+	for i := 0; i < n; i++ {
+		if rec := h.do(req("GET", "http://nope.example.com/x")); rec.Code != http.StatusNotFound {
+			t.Fatalf("request %d: status %d, want 404", i, rec.Code)
+		}
+	}
+
+	warns := 0
+	for _, e := range h.oplog.entries(t) {
+		if e.Msg == msgUnknownHost {
+			warns++
+		}
+	}
+	if warns != 1 {
+		t.Fatalf("unknown-host warnings = %d after %d requests, want exactly 1 (rate-limited)", warns, n)
+	}
+}
+
+// readerOnly hides any WriteTo the wrapped reader has, so io.Copy cannot prefer
+// the source's WriteTo over the destination's ReadFrom -- which is the case that
+// matters, since the real static source (*os.File) has no WriteTo either.
+type readerOnly struct{ io.Reader }
+
+// readerFromWriter is a ResponseWriter whose ReadFrom records that it was used,
+// standing in for *http.response's sendfile fast path.
+type readerFromWriter struct {
+	header       http.Header
+	readFromUsed bool
+}
+
+func (w *readerFromWriter) Header() http.Header         { return w.header }
+func (w *readerFromWriter) Write(b []byte) (int, error) { return len(b), nil }
+func (w *readerFromWriter) WriteHeader(int)             {}
+func (w *readerFromWriter) ReadFrom(src io.Reader) (int64, error) {
+	w.readFromUsed = true
+	return io.Copy(io.Discard, src)
+}
+
+// respRecorder must re-expose the underlying writer's ReadFrom, or wrapping it
+// would silently drop static serving from sendfile to a userspace copy.
+func TestRespRecorderDelegatesReadFrom(t *testing.T) {
+	var _ io.ReaderFrom = (*respRecorder)(nil) // compile-time: ReadFrom present
+
+	under := &readerFromWriter{header: http.Header{}}
+	rr := &respRecorder{ResponseWriter: under}
+
+	n, err := io.Copy(rr, readerOnly{strings.NewReader("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !under.readFromUsed {
+		t.Fatal("io.Copy did not reach the underlying ReadFrom; the sendfile path is hidden")
+	}
+	if n != 5 || rr.bytes != 5 {
+		t.Fatalf("n=%d rr.bytes=%d, want 5", n, rr.bytes)
+	}
+}
+
+// When the underlying writer has no ReadFrom (a test recorder, say), the
+// fallback still copies correctly and still counts bytes for the access log.
+func TestRespRecorderReadFromFallback(t *testing.T) {
+	under := httptest.NewRecorder()
+	rr := &respRecorder{ResponseWriter: under}
+
+	n, err := io.Copy(rr, readerOnly{strings.NewReader("hello")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 5 || rr.bytes != 5 || under.Body.String() != "hello" {
+		t.Fatalf("fallback copy wrong: n=%d bytes=%d body=%q", n, rr.bytes, under.Body.String())
 	}
 }
 

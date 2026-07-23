@@ -61,6 +61,27 @@ func TestRouterClientTLSDisabled(t *testing.T) {
 	}
 }
 
+// The fail-open counterpart to TestRouterClientTLSDisabled: a hop enabled with
+// no CA verifies against the system roots -- RootCAs nil, verification still on,
+// not skip-verify. Intentional for publicly-trusted server certs; with an
+// internal CA it fails at the handshake, and the controller warns about the
+// worker hops at startup. Pinned so the behavior is a deliberate choice.
+func TestRouterClientTLSEnabledWithoutCAUsesSystemRoots(t *testing.T) {
+	cfg, err := flags("", "", false).clientTLS("controller:9440", true, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg == nil {
+		t.Fatal("an enabled hop must produce a TLS config")
+	}
+	if cfg.RootCAs != nil {
+		t.Fatal("no CA configured but RootCAs is set; expected the system-roots fallback")
+	}
+	if cfg.InsecureSkipVerify {
+		t.Fatal("verification must stay on; system roots is not skip-verify")
+	}
+}
+
 func TestRouterClientTLSDerivesServerName(t *testing.T) {
 	f := flags(string(caPEM(t)), "", false)
 	for _, tt := range []struct{ target, want string }{

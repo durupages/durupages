@@ -58,6 +58,17 @@ func envBool(key string) bool {
 // clientTLS builds the TLS config for one dial target, or nil when that hop
 // stays plaintext.
 //
+// The enable flag, not the presence of a CA, decides whether the hop is
+// encrypted. This is deliberate: the CA is shared across hops, so its presence
+// cannot mean "TLS every hop" -- during a one-hop-at-a-time migration the CA is
+// in place while some hops are still plaintext. The consequence is a fail-open
+// edge: a CA supplied with the enable flag forgotten dials plaintext (the CA
+// unused), and the flag set without any CA verifies against the system roots
+// (which an internal CA fails at the first handshake). Erroring on either would
+// break the incremental and public-CA workflows respectively, so neither is
+// rejected here; the controller logs the "TLS advertised, no CA" case at
+// startup for the worker hops it configures.
+//
 // serverName falls back to the host part of the target. That derivation is not
 // a nicety: tlsconf's file-based CA path verifies the hostname itself and
 // refuses to build a config without one, and an empty name on the inline-PEM

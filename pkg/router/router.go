@@ -37,6 +37,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/durupages/durupages/pkg/api"
@@ -123,6 +124,12 @@ type Router struct {
 	// still takes effect. slog loggers are safe for concurrent use, so no
 	// mutex is needed here.
 	logger *slog.Logger
+
+	// unknownHostLast / unknownHostSuppressed rate-limit the unknown-host
+	// warning, whose trigger (the request Host) is entirely client-controlled.
+	// See logUnknownHost.
+	unknownHostLast       atomic.Int64 // unix-nano of the last emitted line
+	unknownHostSuppressed atomic.Int64 // lines dropped since that emission
 }
 
 // errUnknownHost is returned internally when the controller does not know the
@@ -194,9 +201,10 @@ func (rt *Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// Warn, not info: reaching the data plane with a host it cannot map
 			// is normally a DNS/custom-domain misconfiguration worth surfacing.
 			// It is also what internet background noise aimed at the bare
-			// address produces, hence one line and no stack of detail.
-			rt.logEvent(r, rl, slog.LevelWarn, msgUnknownHost,
-				slog.Int("status", http.StatusNotFound))
+			// address produces -- and the Host is client-controlled -- so the
+			// warning is rate-limited (logUnknownHost) rather than emitted once
+			// per request.
+			rt.logUnknownHost(r, rl)
 			http.Error(w, "404 page not found", http.StatusNotFound)
 			return
 		}

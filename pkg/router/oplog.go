@@ -4,6 +4,7 @@
 package router
 
 import (
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -98,6 +99,40 @@ func (rt *Router) logEvent(r *http.Request, rl *reqLog, level slog.Level, msg st
 	logger.LogAttrs(r.Context(), level, msg, attrs...)
 }
 
+// unknownHostLogInterval bounds how often the unknown-host warning is emitted.
+const unknownHostLogInterval = 10 * time.Second
+
+// logUnknownHost emits the unknown-host warning at most once per
+// unknownHostLogInterval, carrying the count suppressed since the last line.
+//
+// Unlike every other operational line, this one's trigger is fully
+// client-controlled: the request Host. Logging one synchronous slog line per
+// request would let a trivial flood of bogus Host headers (or hits on the bare
+// node address, which the comment at the call site calls out as background
+// noise) amplify into unbounded log volume, and because the line is written
+// synchronously to stderr, couple log-sink backpressure straight to request
+// latency. Rate-limiting caps both regardless of request rate while still
+// surfacing the misconfiguration it is meant to catch.
+func (rt *Router) logUnknownHost(r *http.Request, rl *reqLog) {
+	logger := rt.log()
+	if !logger.Enabled(r.Context(), slog.LevelWarn) {
+		return
+	}
+	now := rt.now().UnixNano()
+	last := rt.unknownHostLast.Load()
+	if now-last < int64(unknownHostLogInterval) || !rt.unknownHostLast.CompareAndSwap(last, now) {
+		// Within the window, or lost the race to another goroutine that is
+		// emitting this tick: record the drop and stay silent.
+		rt.unknownHostSuppressed.Add(1)
+		return
+	}
+	extra := []slog.Attr{slog.Int("status", http.StatusNotFound)}
+	if n := rt.unknownHostSuppressed.Swap(0); n > 0 {
+		extra = append(extra, slog.Int64("suppressedSince", n))
+	}
+	rt.logEvent(r, rl, slog.LevelWarn, msgUnknownHost, extra...)
+}
+
 // pageAttrs is the page attribution shared by every line once the host has been
 // resolved. It returns nil before that.
 func pageAttrs(page *api.PageInfo) []slog.Attr {
@@ -179,3 +214,27 @@ func (w *respRecorder) Write(b []byte) (int, error) {
 
 // Unwrap exposes the wrapped writer to http.ResponseController.
 func (w *respRecorder) Unwrap() http.ResponseWriter { return w.ResponseWriter }
+
+// ReadFrom keeps static serving's zero-copy (sendfile) path. Static assets are
+// served with io.Copy(w, *os.File); io.Copy uses the destination's
+// io.ReaderFrom when it has one, and *http.response implements ReadFrom with a
+// sendfile fast path. Wrapping the writer would hide that ReaderFrom (io.Copy
+// does not look through Unwrap), forcing a userspace 32 KiB copy on every asset,
+// so respRecorder re-exposes it, delegating to the underlying writer's ReadFrom.
+func (w *respRecorder) ReadFrom(src io.Reader) (int64, error) {
+	if !w.wrote {
+		w.status = http.StatusOK
+		w.wrote = true
+	}
+	rf, ok := w.ResponseWriter.(io.ReaderFrom)
+	if !ok {
+		// No fast path on the underlying writer (e.g. a test recorder); a plain
+		// copy still works and still counts bytes for the access log.
+		n, err := io.Copy(w.ResponseWriter, src)
+		w.bytes += n
+		return n, err
+	}
+	n, err := rf.ReadFrom(src)
+	w.bytes += n
+	return n, err
+}
