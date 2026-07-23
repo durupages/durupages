@@ -638,6 +638,122 @@ func TestScaleDownReplacesFailedCreatingPod(t *testing.T) {
 	}
 }
 
+// The sibling of the test above for the far more common failure: a pod that
+// never becomes Ready without ever reaching Kubernetes' terminal PodFailed
+// phase -- an unschedulable pod (a nodeSelector/affinity/taint nothing
+// satisfies) or one stuck pulling its image. It stays Pending, so the
+// Failed-pod reclaim never fires, and being non-seeded the old adoption-window
+// cleanup skipped it too; it wedged the tenant until a controller restart. The
+// registration-timeout deadline must reclaim it.
+func TestScaleDownReplacesPendingNeverRegisteringPod(t *testing.T) {
+	e := setup(t, func(o *Options) { o.PodRegistrationTimeout = time.Second })
+	e.putTenant("acme", 1) // ceiling of 1: one stuck pod fully blocks scale-up
+	// A generous queue timeout so neither request expires while the fake clock
+	// is advanced past the (much shorter) registration timeout.
+	e.putPage("blog", "acme", "dep1", 30*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	_ = e.acquireAsync(ctx, "acme", "blog") // triggers scale-up; will never be served
+
+	waitFor(t, 2*time.Second, "pod create", func() bool { return len(e.pm.createdNames()) >= 1 })
+	podName := e.pm.createdNames()[0]
+
+	tn := e.c.getTenant("acme")
+	tn.mu.Lock()
+	p := tn.pods[podName]
+	if p == nil || p.phase != phaseCreating || p.seeded {
+		t.Fatalf("expected a non-seeded phaseCreating pod, got %+v", p)
+	}
+	tn.mu.Unlock()
+
+	// The pod is still there on the next list -- Pending, NOT Failed: it is
+	// unschedulable / stuck pulling and will never call Register.
+	e.pm.setList([]ExistingPod{{
+		Name:     podName,
+		TenantID: "acme",
+		Labels:   map[string]string{labelAppName: appNameWorker, labelTenantID: "acme"},
+		Failed:   false,
+	}})
+
+	// Before the deadline, nothing reclaims it.
+	e.c.scaleDownOnce(context.Background())
+	for _, n := range e.pm.deletedNames() {
+		if n == podName {
+			t.Fatal("pod deleted before its registration deadline")
+		}
+	}
+
+	// Past the registration deadline, scaleDownOnce deletes it regardless of
+	// phase or seeded.
+	e.clock.Advance(2 * time.Second)
+	e.c.scaleDownOnce(context.Background())
+	waitFor(t, 2*time.Second, "pending pod deleted", func() bool {
+		for _, n := range e.pm.deletedNames() {
+			if n == podName {
+				return true
+			}
+		}
+		return false
+	})
+	tn.mu.Lock()
+	_, stillTracked := tn.pods[podName]
+	tn.mu.Unlock()
+	if stillTracked {
+		t.Fatal("the pending pod is still tracked; it will keep blocking scale-up")
+	}
+
+	// The slot is free; a fresh request creates a replacement that can register.
+	e.pm.setList(nil)
+	res2 := e.acquireAsync(ctx, "acme", "blog")
+	waitFor(t, 2*time.Second, "replacement pod create", func() bool {
+		return len(e.pm.createdNames()) >= 2
+	})
+	replacement := e.pm.createdNames()[len(e.pm.createdNames())-1]
+	if replacement == podName {
+		t.Fatal("no replacement pod was created")
+	}
+	e.register(t, replacement, "acme", "10.0.0.9:8080")
+
+	select {
+	case r := <-res2:
+		if r.err != nil || r.lease == nil {
+			t.Fatalf("expected a grant once the replacement registered, got %+v", r)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("request never granted; the tenant is still wedged behind the pending pod")
+	}
+}
+
+// A freshly-created pod must not be reclaimed before its registration deadline,
+// or a normal cold start (image pull + boot) would be deleted mid-flight and
+// churn forever.
+func TestScaleDownKeepsCreatingPodBeforeDeadline(t *testing.T) {
+	e := setup(t, func(o *Options) { o.PodRegistrationTimeout = time.Minute })
+	e.putTenant("acme", 1)
+	e.putPage("blog", "acme", "dep1", 30*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	_ = e.acquireAsync(ctx, "acme", "blog")
+	waitFor(t, 2*time.Second, "pod create", func() bool { return len(e.pm.createdNames()) >= 1 })
+	podName := e.pm.createdNames()[0]
+	e.pm.setList([]ExistingPod{{
+		Name:     podName,
+		TenantID: "acme",
+		Labels:   map[string]string{labelAppName: appNameWorker, labelTenantID: "acme"},
+	}})
+
+	// Only a few seconds elapse -- well inside the registration deadline.
+	e.clock.Advance(5 * time.Second)
+	e.c.scaleDownOnce(context.Background())
+	for _, n := range e.pm.deletedNames() {
+		if n == podName {
+			t.Fatal("a still-starting pod was deleted before its registration deadline")
+		}
+	}
+}
+
 // ---- ResolvePage --------------------------------------------------------
 
 func TestResolvePage(t *testing.T) {

@@ -56,7 +56,9 @@ type pod struct {
 	createdAt time.Time
 	// seeded marks a pod discovered by reconcile that has not registered yet.
 	seeded bool
-	// adoptDeadline is when a seeded pod is deleted if it never registers.
+	// adoptDeadline is when a still-creating pod is deleted if it never
+	// registers. Set on both reconcile-seeded pods (a short window) and
+	// freshly-created ones (PodRegistrationTimeout); zero means "no deadline".
 	adoptDeadline time.Time
 	// drainDeadline bounds the graceful drain of a draining pod.
 	drainDeadline time.Time
@@ -375,6 +377,12 @@ func (c *Controller) maybeScaleUp(t *tenant) {
 			loaded:    map[string]string{},
 			jwtExpiry: c.now().Add(c.opts.WorkerJWTTTL),
 			createdAt: c.now(),
+			// A pod that never registers (unschedulable, or stuck pulling) is
+			// deleted once this passes, freeing its slot for a replacement.
+			// Reconcile-seeded pods get a much shorter window (they are already
+			// running and only need to re-register); a fresh pod needs room to
+			// pull its image and start.
+			adoptDeadline: c.now().Add(c.opts.PodRegistrationTimeout),
 		}
 		specs = append(specs, spec)
 		effective++

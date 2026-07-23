@@ -384,6 +384,83 @@ func TestKubePodsRejectsSystemLabelConflict(t *testing.T) {
 	}
 }
 
+// A tenant must not be able to relax its own worker container's security
+// profile through the AppArmor/seccomp annotations still honoured by many
+// clusters -- the securityContext fields themselves are unreachable, but the
+// annotation-shaped hole beside them has to be closed too.
+func TestKubePodsRejectsTenantSecurityAnnotations(t *testing.T) {
+	kp, _ := newKubePodsForTest(t)
+	ctx := context.Background()
+
+	for _, key := range []string{
+		"container.apparmor.security.beta.kubernetes.io/" + workerContainerName,
+		"Container.AppArmor.Security.Beta.Kubernetes.io/x", // case-insensitive
+		"seccomp.security.alpha.kubernetes.io/pod",
+		"container.seccomp.security.alpha.kubernetes.io/" + workerContainerName,
+	} {
+		err := kp.Create(ctx, PodSpec{
+			Name: "p", TenantID: "acme",
+			Annotations: map[string]string{key: "unconfined"},
+		})
+		if err == nil {
+			t.Fatalf("accepted security annotation %q", key)
+		}
+	}
+}
+
+// The operator's cluster-wide overrides are trusted: a security annotation
+// there is the platform's own call and is not filtered.
+func TestKubePodsAllowsOperatorSecurityAnnotations(t *testing.T) {
+	kp, cs := newKubePodsWithOverrides(t, WorkerPodOverrides{
+		Annotations: map[string]string{
+			"container.apparmor.security.beta.kubernetes.io/" + workerContainerName: "runtime/default",
+		},
+	})
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+	if pod.Annotations["container.apparmor.security.beta.kubernetes.io/"+workerContainerName] != "runtime/default" {
+		t.Fatalf("operator security annotation lost: %v", pod.Annotations)
+	}
+}
+
+// The single most important invariant: no tenant-supplied label or annotation
+// can reach the injected secret env, the security context, the service account
+// or the restart policy. They structurally cannot (those are struct fields the
+// controller sets and the merges only touch metadata), but it is worth pinning.
+func TestKubePodsTenantMetadataCannotReachCoreSpec(t *testing.T) {
+	kp, cs := newKubePodsForTest(t)
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Labels:      map[string]string{"team": "web"},
+		Annotations: map[string]string{"example.com/note": "hi"},
+		Env: map[string]string{
+			"DURUPAGES_WORKER_JWT":  "signed-jwt",
+			"DURUPAGES_CA_CERT_PEM": "ca-pem",
+		},
+	})
+
+	if pod.Spec.ServiceAccountName != "durupages-worker-noperm" {
+		t.Fatalf("service account changed: %q", pod.Spec.ServiceAccountName)
+	}
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("restart policy changed: %q", pod.Spec.RestartPolicy)
+	}
+	sc := pod.Spec.Containers[0].SecurityContext
+	if sc == nil || !*sc.ReadOnlyRootFilesystem || !*sc.RunAsNonRoot {
+		t.Fatalf("container security context weakened: %+v", sc)
+	}
+	// The injected secret env is a container field, never surfaced as metadata.
+	if _, ok := pod.Annotations["DURUPAGES_WORKER_JWT"]; ok {
+		t.Fatal("injected env leaked into annotations")
+	}
+	env := map[string]string{}
+	for _, e := range pod.Spec.Containers[0].Env {
+		env[e.Name] = e.Value
+	}
+	if env["DURUPAGES_WORKER_JWT"] != "signed-jwt" || env["DURUPAGES_CA_CERT_PEM"] != "ca-pem" {
+		t.Fatalf("injected env not carried on the container: %v", env)
+	}
+}
+
 func TestKubePodsListFiltersAndMapsTenant(t *testing.T) {
 	kp, cs := newKubePodsForTest(t)
 	ctx := context.Background()

@@ -103,6 +103,19 @@ func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 	if err := validateNoSystemKeys(spec.Annotations); err != nil {
 		return err
 	}
+	// A tenant may not weaken its own pod's confinement. The pod/container
+	// securityContext (seccomp, dropped caps, read-only rootfs, non-root) is set
+	// as struct fields a tenant cannot reach, but the AppArmor/seccomp *beta/
+	// alpha annotations* predate those fields and are still honoured on many
+	// clusters, so a tenant annotation like
+	// container.apparmor.security.beta.kubernetes.io/<container>: unconfined
+	// would strip the profile. That stays within the tenant's own pod (no
+	// cross-tenant break), but ARCHITECTURE 6.1 says the system security context
+	// must not be overridable; this closes the annotation-shaped hole beside the
+	// struct fields. Operator CommonPodOverrides are trusted and not filtered.
+	if err := validateNoSecurityAnnotations(spec.Annotations); err != nil {
+		return err
+	}
 	ov := k.opts.CommonPodOverrides
 
 	labels := mergeMap(mergeMap(spec.Labels, ov.Labels), map[string]string{
@@ -236,12 +249,44 @@ func (k *kubePods) resourceRequirements(spec PodSpec) (corev1.ResourceRequiremen
 }
 
 // validateNoSystemKeys rejects tenant metadata that collides with reserved
-// system prefixes.
+// system prefixes. Keys are lowercased before comparison, matching how
+// apimachinery treats key case and how validateMetadataMap validates, so the
+// two agree (Kubernetes would reject a mixed-case prefix anyway, but the check
+// should not depend on that).
 func validateNoSystemKeys(m map[string]string) error {
 	for k := range m {
+		lk := strings.ToLower(k)
 		for _, prefix := range systemLabelPrefixes {
-			if strings.HasPrefix(k, prefix) {
+			if strings.HasPrefix(lk, prefix) {
 				return fmt.Errorf("controller: metadata key %q uses reserved system prefix %q", k, prefix)
+			}
+		}
+	}
+	return nil
+}
+
+// securityAnnotationPrefixes name the container security profile through an
+// annotation rather than a securityContext field. A tenant setting any of them
+// on its own worker pod could relax the confinement the platform pins, so they
+// are rejected on tenant metadata (see Create). Lowercase; matched
+// case-insensitively.
+var securityAnnotationPrefixes = []string{
+	"container.apparmor.security.beta.kubernetes.io/",
+	"apparmor.security.beta.kubernetes.io/",
+	"seccomp.security.alpha.kubernetes.io/",
+	"container.seccomp.security.alpha.kubernetes.io/",
+}
+
+// validateNoSecurityAnnotations rejects tenant annotations that would override
+// the worker container's security profile (AppArmor/seccomp beta/alpha
+// annotations still honoured by many clusters).
+func validateNoSecurityAnnotations(m map[string]string) error {
+	for k := range m {
+		lk := strings.ToLower(k)
+		for _, prefix := range securityAnnotationPrefixes {
+			if strings.HasPrefix(lk, prefix) {
+				return fmt.Errorf("controller: annotation key %q sets a container security profile, "+
+					"which the platform pins and a tenant may not override", k)
 			}
 		}
 	}

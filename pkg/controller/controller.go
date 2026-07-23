@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -115,6 +116,19 @@ type Options struct {
 	// HeartbeatInterval is advertised to shims and drives the reconcile adoption
 	// window (2x this value). Default 10s.
 	HeartbeatInterval time.Duration
+	// PodRegistrationTimeout bounds how long a freshly-created worker pod may
+	// take to register before the controller gives up on it, deletes it and
+	// frees the slot it was holding. Without it a pod that never becomes Ready
+	// -- an unschedulable pod (a nodeSelector/affinity/taint the cluster cannot
+	// satisfy) or one stuck on an image pull -- would sit in phaseCreating
+	// forever, counted toward the tenant's pod ceiling, so no replacement is
+	// ever created and every request for that tenant queues and times out. Such
+	// a pod never reaches Kubernetes' terminal PodFailed phase (it stays
+	// Pending), so the failed-pod reclaim cannot catch it; this timeout does.
+	//
+	// It must comfortably exceed a realistic cold image pull, since a pod
+	// deleted mid-pull would only be recreated to pull again. Default 5m.
+	PodRegistrationTimeout time.Duration
 	// WorkerJWTTTL is the lifetime of issued worker JWTs (default 1h).
 	WorkerJWTTTL time.Duration
 	// LeaseGrace is the slack added past a lease deadline before the watchdog
@@ -198,6 +212,7 @@ func New(opts Options) (*Controller, error) {
 
 	setDurDefault(&opts.ScaleDownInterval, 30*time.Second)
 	setDurDefault(&opts.HeartbeatInterval, 10*time.Second)
+	setDurDefault(&opts.PodRegistrationTimeout, 5*time.Minute)
 	setDurDefault(&opts.WorkerJWTTTL, time.Hour)
 	setDurDefault(&opts.LeaseGrace, 10*time.Second)
 	setDurDefault(&opts.DrainGrace, d.RequestTimeout)
@@ -216,6 +231,21 @@ func New(opts Options) (*Controller, error) {
 		if workerCA, err = newCAFileCache(opts.WorkerCACertFile); err != nil {
 			return nil, err
 		}
+	}
+
+	// Advertising TLS to workers without giving them a CA leaves them verifying
+	// against the system roots, which fails as "unknown authority" on a worker's
+	// first dial rather than at startup. That is correct only when the servers
+	// present publicly-trusted certificates (an ACME/public CA); with an
+	// internal CA it is a forgotten --worker-ca-cert-file. It is not an error --
+	// the system-roots case is legitimate -- but it is worth saying out loud at
+	// startup rather than leaving it to surface later as a dial failure. This is
+	// only observability; TLS itself never silently downgrades to plaintext.
+	if (opts.ControllerTLS || opts.HubLogTLS) && opts.WorkerCACertFile == "" {
+		slog.Warn("controller: advertising TLS to workers with no worker CA configured; "+
+			"workers will verify against the system trust store -- correct for publicly-trusted "+
+			"server certificates, but a missing --worker-ca-cert-file when the servers use an internal CA",
+			"controllerTLS", opts.ControllerTLS, "hubLogTLS", opts.HubLogTLS)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

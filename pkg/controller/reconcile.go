@@ -103,7 +103,14 @@ func (c *Controller) scaleDownOnce(ctx context.Context) {
 					toDelete = append(toDelete, p.name)
 				}
 			case phaseCreating:
-				if p.seeded && c.now().After(p.adoptDeadline) {
+				// Any creating pod past its registration deadline, seeded or
+				// not. A fresh pod that never becomes Ready (unschedulable, or
+				// stuck pulling) stays Pending -- never PodFailed -- so the
+				// failedNames path above cannot catch it; this does. The
+				// IsZero guard is essential: without it a pod that somehow
+				// carried no deadline would be After(zero)==true and deleted on
+				// the spot.
+				if !p.adoptDeadline.IsZero() && c.now().After(p.adoptDeadline) {
 					toDelete = append(toDelete, p.name)
 				}
 			}
