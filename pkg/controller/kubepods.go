@@ -181,6 +181,9 @@ func (k *kubePods) List(ctx context.Context) ([]ExistingPod, error) {
 			Name:     p.Name,
 			TenantID: p.Labels[labelTenantID],
 			Labels:   p.Labels,
+			// Worker pods run with RestartPolicyNever, so PodFailed is terminal:
+			// the container exited non-zero and Kubernetes will not retry it.
+			Failed: p.Status.Phase == corev1.PodFailed,
 		})
 	}
 	return out, nil

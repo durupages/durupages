@@ -519,6 +519,125 @@ func TestReconcileDeletesUnadoptedPod(t *testing.T) {
 	})
 }
 
+// A pod discovered at reconcile time that has already failed (RestartPolicyNever
+// makes this terminal) must never be adopted: adopting it would only earn it an
+// adoption window it can never use while it sits there indefinitely, since a
+// normally-created (non-seeded) phaseCreating pod has no timeout of its own.
+func TestReconcileExcludesFailedPod(t *testing.T) {
+	e := setup(t, nil)
+	e.pm.setList([]ExistingPod{{
+		Name:     "dead-1",
+		TenantID: "acme",
+		Labels:   map[string]string{labelAppName: appNameWorker, labelTenantID: "acme"},
+		Failed:   true,
+	}})
+
+	e.c.reconcile(context.Background())
+
+	tn := e.c.getTenant("acme")
+	tn.mu.Lock()
+	_, adopted := tn.pods["dead-1"]
+	tn.mu.Unlock()
+	if adopted {
+		t.Fatal("a failed pod was adopted into the tenant's pool")
+	}
+	waitFor(t, 2*time.Second, "failed pod deleted", func() bool {
+		for _, n := range e.pm.deletedNames() {
+			if n == "dead-1" {
+				return true
+			}
+		}
+		return false
+	})
+}
+
+// The bug this guards: a pod that fails AFTER maybeScaleUp creates it (bad
+// image, crash on boot -- never seeded, so the adoption-window cleanup never
+// applied to it at all) used to sit in phaseCreating forever. It kept counting
+// toward the tenant's pod ceiling (readyCreatingCountLocked), so maybeScaleUp
+// believed capacity was already met and never created a replacement: every
+// request queued and timed out against a pod that would never register, with
+// no way out short of a manual delete. scaleDownOnce must recognize the failure
+// from the pod list and delete it itself, on any phase, seeded or not.
+func TestScaleDownReplacesFailedCreatingPod(t *testing.T) {
+	e := setup(t, nil)
+	e.putTenant("acme", 1) // ceiling of 1: a stuck failed pod fully blocks scale-up
+	e.putPage("blog", "acme", "dep1", 3*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	res := e.acquireAsync(ctx, "acme", "blog")
+
+	// maybeScaleUp creates the one pod the ceiling allows. It never registers --
+	// its container is about to crash.
+	waitFor(t, 2*time.Second, "pod create", func() bool { return len(e.pm.createdNames()) >= 1 })
+	podName := e.pm.createdNames()[0]
+
+	tn := e.c.getTenant("acme")
+	tn.mu.Lock()
+	p := tn.pods[podName]
+	if p == nil || p.phase != phaseCreating || p.seeded {
+		t.Fatalf("expected a non-seeded phaseCreating pod, got %+v", p)
+	}
+	tn.mu.Unlock()
+
+	// The pod now reports Failed on the next list -- RestartPolicyNever, the
+	// container exited non-zero, it will never call Register.
+	e.pm.setList([]ExistingPod{{
+		Name:     podName,
+		TenantID: "acme",
+		Labels:   map[string]string{labelAppName: appNameWorker, labelTenantID: "acme"},
+		Failed:   true,
+	}})
+	e.c.scaleDownOnce(context.Background())
+
+	waitFor(t, 2*time.Second, "failed pod deleted", func() bool {
+		for _, n := range e.pm.deletedNames() {
+			if n == podName {
+				return true
+			}
+		}
+		return false
+	})
+	tn.mu.Lock()
+	_, stillTracked := tn.pods[podName]
+	tn.mu.Unlock()
+	if stillTracked {
+		t.Fatal("the failed pod is still tracked; it will keep blocking scale-up")
+	}
+
+	// The slot is free, but scale-up is request-driven (ARCHITECTURE 6.4): only
+	// deleting the pod is not enough, something has to ask again. That is
+	// exactly what a client retrying after its own queue timeout -- or any
+	// other concurrent request for the tenant -- does in production; simulate
+	// it with a second request rather than reaching in and calling
+	// maybeScaleUp directly.
+	e.pm.setList(nil)
+	res2 := e.acquireAsync(ctx, "acme", "blog")
+
+	waitFor(t, 2*time.Second, "replacement pod create", func() bool {
+		return len(e.pm.createdNames()) >= 2
+	})
+	replacement := e.pm.createdNames()[len(e.pm.createdNames())-1]
+	if replacement == podName {
+		t.Fatal("no replacement pod was created")
+	}
+	e.register(t, replacement, "acme", "10.0.0.9:8080")
+
+	// Both the original (queued first) and the retriggering request are
+	// eventually granted from the replacement pod.
+	for _, ch := range []<-chan acquireResult{res, res2} {
+		select {
+		case r := <-ch:
+			if r.err != nil || r.lease == nil {
+				t.Fatalf("expected a grant once the replacement registered, got %+v", r)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("request never granted; it is still stuck behind the failed pod's slot")
+		}
+	}
+}
+
 // ---- ResolvePage --------------------------------------------------------
 
 func TestResolvePage(t *testing.T) {
