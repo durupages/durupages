@@ -7,3 +7,10 @@
 /native/durupages-workerd/bazel-*
 /.dev/kubeconfig
 dist/
+
+# Compiled binaries from `go build ./cmd/<name>`, which writes into the repo root.
+/duru
+/durupages-controller
+/durupages-router
+/durupages-hub
+/durupages-worker-shim

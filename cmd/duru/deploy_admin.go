@@ -50,6 +50,13 @@ func deployViaAdmin(o deployOptions, adminURL string) error {
 	}
 
 	o.DeploymentID = res.DeploymentID
+	// The controller is the authority on the pages domain: it is the value that
+	// actually routes. Without this the CLI would report its own default
+	// (pages.local) even after the deployment's domain had been changed
+	// server-side. An explicit --pages-domain still wins.
+	if res.PagesDomain != "" && !o.PagesDomainSet {
+		o.PagesDomain = res.PagesDomain
+	}
 	o.report(res.Manifest.StaticFileCount, res.Manifest.HasWorker)
 	return nil
 }
@@ -60,7 +67,10 @@ func deployViaAdmin(o deployOptions, adminURL string) error {
 type uploadResult struct {
 	DeploymentID string `json:"deploymentId"`
 	Activated    bool   `json:"activated"`
-	Manifest     struct {
+	// PagesDomain is the domain the controller serves pages on. Older
+	// controllers do not send it, hence the fallback to the local flag.
+	PagesDomain string `json:"pagesDomain"`
+	Manifest    struct {
 		HasWorker       bool `json:"hasWorker"`
 		StaticFileCount int  `json:"staticFileCount"`
 	} `json:"manifest"`

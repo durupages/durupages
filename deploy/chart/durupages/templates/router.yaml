@@ -8,19 +8,20 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "durupages.componentLabels" (dict "root" . "component" "router") | nindent 4 }}
+    {{- with .Values.router.service.labels }}{{ toYaml . | nindent 4 }}{{- end }}
   {{- with .Values.router.service.annotations }}
   annotations:
     {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  type: {{ .Values.router.service.type }}
+  {{- include "durupages.service.spec" (dict "service" .Values.router.service) | nindent 2 }}
   ports:
     - name: http
       port: {{ .Values.router.service.port }}
       targetPort: http
       protocol: TCP
-      {{- if and (eq .Values.router.service.type "NodePort") .Values.router.service.nodePort }}
-      nodePort: {{ .Values.router.service.nodePort }}
+      {{- with .Values.router.service.nodePort }}
+      nodePort: {{ . }}
       {{- end }}
   selector:
     {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "router") | nindent 4 }}
@@ -53,10 +54,13 @@ spec:
       {{- end }}
       containers:
         - name: router
-          image: "{{ .Values.router.image.repository }}:{{ .Values.router.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "durupages.image" (dict "root" . "image" .Values.router.image) | quote }}
           imagePullPolicy: {{ .Values.router.image.pullPolicy }}
           args:
             - --resolve-cache-ttl={{ .Values.router.resolveCacheTTL }}
+            {{- with .Values.router.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           env:
             - name: DURUPAGES_LISTEN
               value: ":{{ .Values.router.service.port }}"
@@ -67,12 +71,26 @@ spec:
               value: {{ include "durupages.hubLogAddr" . | quote }}
             {{- end }}
             - name: DURUPAGES_PAGES_DOMAIN
-              value: {{ .Values.router.pagesDomain | quote }}
+              value: {{ .Values.pagesDomain | quote }}
             - name: DURUPAGES_STATIC_CACHE_DIR
               value: {{ .Values.router.staticCacheDir | quote }}
             - name: DURUPAGES_STATIC_CACHE_MAX_BYTES
-              value: {{ .Values.router.staticCacheMaxBytes | quote }}
+              # int64 first: YAML parses a large number as a float, and the
+              # binary's strconv.ParseInt rejects "1.073741824e+09", silently
+              # falling back to its own default.
+              value: {{ .Values.router.staticCacheMaxBytes | int64 | quote }}
+            {{- if include "durupages.tls.caEnabled" . }}
+            # The router is a client only: it needs the CA, never a key pair.
+            - name: DURUPAGES_CA_CERT_FILE
+              value: {{ include "durupages.tls.caFile" . | quote }}
+            {{- end }}
+            {{- with (include "durupages.tls.clientEnv" .) }}
+            {{- . | nindent 12 }}
+            {{- end }}
             {{- include "durupages.s3Env" . | nindent 12 }}
+            {{- with .Values.router.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.router.service.port }}
@@ -88,10 +106,18 @@ spec:
           volumeMounts:
             - name: static-cache
               mountPath: {{ .Values.router.staticCacheDir }}
+            {{- if include "durupages.tls.caEnabled" . }}
+            - name: ca
+              mountPath: {{ include "durupages.tls.caDir" . }}
+              readOnly: true
+            {{- end }}
       volumes:
         - name: static-cache
           emptyDir:
             sizeLimit: {{ .Values.router.staticCacheSize }}
+        {{- if include "durupages.tls.caEnabled" . }}
+        {{- include "durupages.tls.caVolume" . | nindent 8 }}
+        {{- end }}
       {{- with .Values.router.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

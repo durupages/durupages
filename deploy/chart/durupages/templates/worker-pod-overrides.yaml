@@ -1,0 +1,28 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+{{/* Cluster-wide worker pod configuration (nodeSelector, tolerations,
+     affinity, dnsPolicy, dnsConfig, priorityClassName, runtimeClassName,
+     annotations, labels) applied to every worker pod the controller creates.
+
+     Worker pods are created at runtime, in another namespace, by the
+     controller -- this chart never templates one -- so the values cannot be
+     rendered onto them. They travel as a ConfigMap the controller reads at
+     startup instead. Reading once is enough because the controller's pod
+     template carries this ConfigMap's checksum, so changing it rolls the
+     controller and the new configuration applies to pods created after that.
+
+     Rendered only when there is something to say, so an empty map leaves no
+     ConfigMap, no volume and no flag behind. */}}
+{{- if .Values.worker.podOverrides }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "durupages.workerPodOverridesName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "durupages.componentLabels" (dict "root" . "component" "worker") | nindent 4 }}
+data:
+  {{ include "durupages.workerPodOverridesKey" . }}: |
+    {{- include "durupages.workerPodOverridesYAML" . | nindent 4 }}
+{{- end }}

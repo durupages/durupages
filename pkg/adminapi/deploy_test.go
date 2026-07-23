@@ -12,7 +12,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -442,5 +445,57 @@ func TestSanitizeTarPath(t *testing.T) {
 		if got, err := sanitizeTarPath(in); err == nil {
 			t.Fatalf("sanitizeTarPath(%q) = %q, want an error", in, got)
 		}
+	}
+}
+
+// TestUploadUsesConfiguredTempDir pins that extraction happens under
+// Options.TempDir — the whole point of the option on a read-only root
+// filesystem — and that the upload directory is removed afterwards.
+func TestUploadUsesConfiguredTempDir(t *testing.T) {
+	tmp := t.TempDir()
+	d := newDeployFixture(t, func(o *Options) { o.TempDir = tmp })
+
+	d.upload(t, "/v1/pages/blog/deployments?deploymentId=dep-tmp",
+		buildTar(t, site...), "application/x-tar")
+
+	entries, err := os.ReadDir(tmp)
+	if err != nil {
+		t.Fatalf("read temp dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("upload directory left behind in %s: %v", tmp, entries)
+	}
+}
+
+// TestUploadTempDirFailureIsLoggedAndReported covers the production incident:
+// when the upload directory cannot be created the client gets a 500 AND the
+// cause reaches the server log.
+func TestUploadTempDirFailureIsLoggedAndReported(t *testing.T) {
+	logs := newLogCapture()
+	// Point the server at a directory that is removed after New validated it,
+	// which is the closest portable stand-in for a volume that stops being
+	// writable (a read-only root filesystem fails the same way).
+	tmp := filepath.Join(t.TempDir(), "gone")
+	if err := os.Mkdir(tmp, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	d := newDeployFixture(t, func(o *Options) {
+		o.TempDir = tmp
+		o.Logger = logs.logger
+	})
+	if err := os.Remove(tmp); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	rec := do(t, d.s, http.MethodPost, "/v1/pages/blog/deployments",
+		bytes.NewReader(buildTar(t, site...)), "application/x-tar")
+	requireStatus(t, rec, http.StatusInternalServerError)
+
+	entry := logs.only(t)
+	if !strings.Contains(entry.Error, "create temp dir") {
+		t.Fatalf("temp dir failure not logged server-side: %+v", entry)
+	}
+	if entry.Level != slog.LevelError.String() {
+		t.Fatalf("level = %q, want ERROR", entry.Level)
 	}
 }

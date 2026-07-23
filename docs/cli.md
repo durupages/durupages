@@ -103,7 +103,7 @@ redeploy never resets their configuration.
 | `--deployment` | Deployment id (default: generated `dep-<unixNano>`) |
 | `--domain a.com,b.com` | Custom domains to set (replaces the existing set) |
 | `--secrets-file <path>` | Replace **all** of the page's secrets from a JSON or `.env` file, applied before the deployment goes live ([format](#bulk-file-format)) |
-| `--pages-domain` | Pages domain, used only for the printed URL |
+| `--pages-domain` | Pages domain, used only for the printed URL. In admin mode the controller reports the domain it actually serves and that is what gets printed, so this is only needed in direct mode (or to override it) |
 | direct mode | `--pg-dsn`, `--migrate`, `--s3-endpoint`, `--s3-region`, `--s3-bucket`, `--s3-access-key`, `--s3-secret-key`, `--s3-path-style` |
 
 The directory you deploy is exactly the build output you would upload to Cloudflare

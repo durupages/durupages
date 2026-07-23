@@ -6,9 +6,13 @@ package adminapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,14 +20,73 @@ import (
 	"github.com/durupages/durupages/pkg/provider"
 )
 
+// capturedLog is one request log line, decoded from the JSON slog handler the
+// logging tests install.
+type capturedLog struct {
+	Level      string `json:"level"`
+	Msg        string `json:"msg"`
+	Method     string `json:"method"`
+	Path       string `json:"path"`
+	Status     int    `json:"status"`
+	Bytes      int64  `json:"bytes"`
+	DurationMs int64  `json:"durationMs"`
+	RemoteAddr string `json:"remoteAddr"`
+	Error      string `json:"error"`
+}
+
+// logCapture is a slog logger writing JSON lines into a buffer.
+type logCapture struct {
+	buf    bytes.Buffer
+	logger *slog.Logger
+}
+
+func newLogCapture() *logCapture {
+	c := &logCapture{}
+	c.logger = slog.New(slog.NewJSONHandler(&c.buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return c
+}
+
+// lines decodes every captured log line.
+func (c *logCapture) lines(t *testing.T) []capturedLog {
+	t.Helper()
+	var out []capturedLog
+	for _, raw := range strings.Split(strings.TrimSpace(c.buf.String()), "\n") {
+		if raw == "" {
+			continue
+		}
+		var e capturedLog
+		if err := json.Unmarshal([]byte(raw), &e); err != nil {
+			t.Fatalf("log line %q: %v", raw, err)
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// only returns the single captured line, failing when there is not exactly one.
+func (c *logCapture) only(t *testing.T) capturedLog {
+	t.Helper()
+	lines := c.lines(t)
+	if len(lines) != 1 {
+		t.Fatalf("got %d log lines, want 1: %q", len(lines), c.buf.String())
+	}
+	return lines[0]
+}
+
 // fixedNow is the clock injected into every test server.
 var fixedNow = time.Date(2026, 7, 22, 10, 0, 0, 0, time.UTC)
 
 // newTestServer builds a Server, failing the test on a configuration error.
+// Unless a test wires its own logger, requests are logged to io.Discard: the
+// package default is slog.Default(), which would otherwise spray the test
+// output with one line per request.
 func newTestServer(t *testing.T, o Options) *Server {
 	t.Helper()
 	if o.Now == nil {
 		o.Now = func() time.Time { return fixedNow }
+	}
+	if o.Logger == nil {
+		o.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	s, err := New(o)
 	if err != nil {
@@ -492,21 +555,113 @@ func TestRouteErrors(t *testing.T) {
 }
 
 func TestRequestLogging(t *testing.T) {
-	var buf bytes.Buffer
+	logs := newLogCapture()
 	f := newFakeProvider()
-	s := newTestServer(t, Options{Provider: f, Admin: f, LogWriter: &buf})
+	s := newTestServer(t, Options{Provider: f, Admin: f, Logger: logs.logger})
 
 	requireStatus(t, do(t, s, http.MethodGet, "/v1/tenants", nil, ""), http.StatusOK)
-	var entry logEntry
-	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &entry); err != nil {
-		t.Fatalf("log line %q: %v", buf.String(), err)
-	}
+	entry := logs.only(t)
 	if entry.Method != http.MethodGet || entry.Path != "/v1/tenants" || entry.Status != http.StatusOK {
 		t.Fatalf("log entry = %+v", entry)
 	}
 	if entry.Bytes == 0 {
 		t.Fatal("log entry records no response size")
 	}
+	if entry.RemoteAddr == "" {
+		t.Fatal("log entry records no remote address")
+	}
+	if entry.Level != slog.LevelInfo.String() {
+		t.Fatalf("level = %q, want %q", entry.Level, slog.LevelInfo)
+	}
+}
+
+// TestRequestLogLevels pins the outcome-to-level mapping an operator alerts on.
+func TestRequestLogLevels(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		wantStatus int
+		wantLevel  slog.Level
+	}{
+		{"ok", "/v1/tenants", http.StatusOK, slog.LevelInfo},
+		{"clientError", "/v1/nope", http.StatusNotFound, slog.LevelWarn},
+		{"serverError", "/v1/tenants", http.StatusInternalServerError, slog.LevelError},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			logs := newLogCapture()
+			f := newFakeProvider()
+			if tc.wantStatus == http.StatusInternalServerError {
+				f.listTenantsErr = errors.New("boom")
+			}
+			s := newTestServer(t, Options{Provider: f, Admin: f, Logger: logs.logger})
+
+			requireStatus(t, do(t, s, http.MethodGet, tc.target, nil, ""), tc.wantStatus)
+			entry := logs.only(t)
+			if entry.Status != tc.wantStatus || entry.Level != tc.wantLevel.String() {
+				t.Fatalf("entry = %+v, want status %d level %s", entry, tc.wantStatus, tc.wantLevel)
+			}
+		})
+	}
+}
+
+// TestServerErrorIsLogged is the operational gap this package used to have: the
+// cause of a 500 must reach the server log, not only the client's response.
+func TestServerErrorIsLogged(t *testing.T) {
+	logs := newLogCapture()
+	f := newFakeProvider()
+	f.listTenantsErr = errors.New("read-only file system")
+	s := newTestServer(t, Options{Provider: f, Admin: f, Logger: logs.logger})
+
+	rec := do(t, s, http.MethodGet, "/v1/tenants", nil, "")
+	requireStatus(t, rec, http.StatusInternalServerError)
+	if code := errorCode(t, rec); code != codeInternal {
+		t.Fatalf("code = %q", code)
+	}
+	entry := logs.only(t)
+	if !strings.Contains(entry.Error, "read-only file system") {
+		t.Fatalf("log entry does not carry the cause: %+v", entry)
+	}
+	// The detail also stays in the response body: this is a private admin port
+	// and the CLI is how operators normally see the failure.
+	if !strings.Contains(rec.Body.String(), "read-only file system") {
+		t.Fatalf("response body dropped the cause: %s", rec.Body.String())
+	}
+}
+
+// TestSuccessNotLoggedAsError guards against every line gaining an "error"
+// attribute once writeError participates in logging.
+func TestSuccessNotLoggedAsError(t *testing.T) {
+	logs := newLogCapture()
+	f := newFakeProvider()
+	s := newTestServer(t, Options{Provider: f, Admin: f, Logger: logs.logger})
+
+	requireStatus(t, do(t, s, http.MethodGet, "/v1/nope", nil, ""), http.StatusNotFound)
+	if entry := logs.only(t); entry.Error != "" {
+		t.Fatalf("4xx must not carry a server-side error detail: %+v", entry)
+	}
+}
+
+// TestQueryStringNotLogged pins the decision that the raw query never reaches
+// the log, since operator middleware may carry a token there.
+func TestQueryStringNotLogged(t *testing.T) {
+	logs := newLogCapture()
+	f := newFakeProvider()
+	s := newTestServer(t, Options{Provider: f, Admin: f, Logger: logs.logger})
+
+	requireStatus(t, do(t, s, http.MethodGet, "/v1/tenants?token=supersecret", nil, ""), http.StatusOK)
+	if strings.Contains(logs.buf.String(), "supersecret") {
+		t.Fatalf("query string leaked into the log: %q", logs.buf.String())
+	}
+}
+
+// TestWriteErrorWithoutRecorder covers handlers driven by a bare
+// httptest.ResponseRecorder: recording the server-side detail must be a no-op,
+// never a panic.
+func TestWriteErrorWithoutRecorder(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeError(rec, http.StatusInternalServerError, codeInternal, "boom")
+	requireStatus(t, rec, http.StatusInternalServerError)
 }
 
 // ---- middleware extension point ----
@@ -572,19 +727,19 @@ func TestMiddlewareOrderAndCoverage(t *testing.T) {
 // a middleware refuses still produce a log line with its status.
 func TestMiddlewareRejectionIsLogged(t *testing.T) {
 	f := newFakeProvider()
-	var logs strings.Builder
+	logs := newLogCapture()
 	deny := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "nope", http.StatusForbidden)
 		})
 	}
-	s := newTestServer(t, Options{Provider: f, Admin: f, LogWriter: &logs,
+	s := newTestServer(t, Options{Provider: f, Admin: f, Logger: logs.logger,
 		Middleware: []func(http.Handler) http.Handler{deny}})
 
 	rec := do(t, s, http.MethodGet, "/v1/tenants", nil, "")
 	requireStatus(t, rec, http.StatusForbidden)
-	if !strings.Contains(logs.String(), `"status":403`) {
-		t.Fatalf("rejected request not logged: %q", logs.String())
+	if entry := logs.only(t); entry.Status != http.StatusForbidden {
+		t.Fatalf("rejected request not logged: %+v", entry)
 	}
 }
 
@@ -598,5 +753,72 @@ func TestMiddlewareNilRejected(t *testing.T) {
 	returnsNil := func(http.Handler) http.Handler { return nil }
 	if _, err := New(Options{Provider: f, Middleware: []func(http.Handler) http.Handler{returnsNil}}); err == nil {
 		t.Fatal("expected an error for a middleware returning nil")
+	}
+}
+
+// ---- temp dir configuration ----
+
+// TestNewValidatesTempDir keeps a misconfigured upload directory (the classic
+// case: a read-only root filesystem with no writable volume mounted) a startup
+// failure instead of a 500 on the first deployment.
+func TestNewValidatesTempDir(t *testing.T) {
+	f := newFakeProvider()
+
+	t.Run("writable", func(t *testing.T) {
+		if _, err := New(Options{Provider: f, TempDir: t.TempDir()}); err != nil {
+			t.Fatalf("New with a writable TempDir: %v", err)
+		}
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		missing := filepath.Join(t.TempDir(), "does-not-exist")
+		if _, err := New(Options{Provider: f, TempDir: missing}); err == nil {
+			t.Fatal("expected an error for a missing TempDir")
+		}
+	})
+
+	t.Run("notADirectory", func(t *testing.T) {
+		file := filepath.Join(t.TempDir(), "regular-file")
+		if err := os.WriteFile(file, []byte("x"), 0o644); err != nil {
+			t.Fatalf("write file: %v", err)
+		}
+		if _, err := New(Options{Provider: f, TempDir: file}); err == nil {
+			t.Fatal("expected an error for a TempDir that is a regular file")
+		}
+	})
+
+	t.Run("readOnly", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("root ignores directory permissions")
+		}
+		dir := filepath.Join(t.TempDir(), "ro")
+		if err := os.Mkdir(dir, 0o555); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if _, err := New(Options{Provider: f, TempDir: dir}); err == nil {
+			t.Fatal("expected an error for a read-only TempDir")
+		}
+	})
+
+	t.Run("emptyLeavesTheDefault", func(t *testing.T) {
+		if _, err := New(Options{Provider: f}); err != nil {
+			t.Fatalf("New without a TempDir: %v", err)
+		}
+	})
+}
+
+// TestTempDirProbeIsCleanedUp makes sure startup validation leaves nothing
+// behind in the upload volume.
+func TestTempDirProbeIsCleanedUp(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := New(Options{Provider: newFakeProvider(), TempDir: dir}); err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("probe directory left behind: %v", entries)
 	}
 }

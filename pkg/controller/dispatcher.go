@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"time"
@@ -55,7 +56,9 @@ type pod struct {
 	createdAt time.Time
 	// seeded marks a pod discovered by reconcile that has not registered yet.
 	seeded bool
-	// adoptDeadline is when a seeded pod is deleted if it never registers.
+	// adoptDeadline is when a still-creating pod is deleted if it never
+	// registers. Set on both reconcile-seeded pods (a short window) and
+	// freshly-created ones (PodRegistrationTimeout); zero means "no deadline".
 	adoptDeadline time.Time
 	// drainDeadline bounds the graceful drain of a draining pod.
 	drainDeadline time.Time
@@ -362,6 +365,10 @@ func (c *Controller) maybeScaleUp(t *tenant) {
 		name := podName(t.id)
 		spec, err := c.buildPodSpec(tenantObj, t.id, name)
 		if err != nil {
+			// Requests keep queueing and eventually time out, which on its own
+			// looks like a capacity problem; say what actually went wrong.
+			slog.Error("controller: cannot build worker pod spec, skipping scale-up",
+				"tenant", t.id, "err", err)
 			break
 		}
 		t.pods[name] = &pod{
@@ -370,6 +377,12 @@ func (c *Controller) maybeScaleUp(t *tenant) {
 			loaded:    map[string]string{},
 			jwtExpiry: c.now().Add(c.opts.WorkerJWTTTL),
 			createdAt: c.now(),
+			// A pod that never registers (unschedulable, or stuck pulling) is
+			// deleted once this passes, freeing its slot for a replacement.
+			// Reconcile-seeded pods get a much shorter window (they are already
+			// running and only need to re-register); a fresh pod needs room to
+			// pull its image and start.
+			adoptDeadline: c.now().Add(c.opts.PodRegistrationTimeout),
 		}
 		specs = append(specs, spec)
 		effective++
@@ -462,6 +475,13 @@ func (c *Controller) buildPodSpec(tenantObj *provider.Tenant, tenantID, name str
 	}
 	if c.opts.BundleSweepInterval != "" {
 		env["DURUPAGES_BUNDLE_SWEEP_INTERVAL"] = c.opts.BundleSweepInterval
+	}
+	// TLS trust for the endpoints above. This can fail (unreadable CA file), and
+	// the failure has to stop pod creation: with TLS on, a pod that starts
+	// without the CA cannot reach the controller or the hub, so it would burn a
+	// slot and a scheduling round only to fail its first dial.
+	if err := c.workerTLSEnv(env); err != nil {
+		return PodSpec{}, err
 	}
 
 	spec := PodSpec{Name: name, TenantID: tenantID, Env: env}

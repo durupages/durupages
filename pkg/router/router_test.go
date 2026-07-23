@@ -4,12 +4,14 @@
 package router
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -243,10 +245,122 @@ type harness struct {
 	rt    *Router
 	ctrl  *fakeController
 	store *countingStorage
-	log   *strings.Builder
+	// log is the USAGE log (pod-log StaticAccess JSON lines).
+	log *strings.Builder
+	// oplog is the OPERATIONAL log (Options.Logger), captured as JSON lines at
+	// debug level so tests can assert on failure causes and access lines.
+	oplog *logCapture
+}
+
+// logCapture is a slog logger writing JSON lines into a buffer.
+type logCapture struct {
+	mu     sync.Mutex
+	buf    bytes.Buffer
+	logger *slog.Logger
+}
+
+func newLogCapture() *logCapture {
+	c := &logCapture{}
+	c.logger = slog.New(slog.NewJSONHandler(&syncWriter{c: c}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return c
+}
+
+// syncWriter serializes writes from concurrent requests into the buffer.
+type syncWriter struct{ c *logCapture }
+
+func (w *syncWriter) Write(b []byte) (int, error) {
+	w.c.mu.Lock()
+	defer w.c.mu.Unlock()
+	return w.c.buf.Write(b)
+}
+
+// logEntry is one decoded operational log line. Attributes the tests do not
+// care about are ignored by encoding/json.
+type logEntry struct {
+	Level          string `json:"level"`
+	Msg            string `json:"msg"`
+	Method         string `json:"method"`
+	Host           string `json:"host"`
+	Path           string `json:"path"`
+	Status         int    `json:"status"`
+	UpstreamStatus int    `json:"upstreamStatus"`
+	Bytes          int64  `json:"bytes"`
+	Route          string `json:"route"`
+	RequestID      string `json:"requestId"`
+	TenantID       string `json:"tenantId"`
+	PageID         string `json:"pageId"`
+	DeploymentID   string `json:"deploymentId"`
+	Endpoint       string `json:"endpoint"`
+	LeaseID        string `json:"leaseId"`
+	GRPCCode       string `json:"grpcCode"`
+	Error          string `json:"error"`
+	AssetHash      string `json:"assetHash"`
+	Raw            string `json:"-"`
+}
+
+// entries decodes every line written so far.
+func (c *logCapture) entries(t *testing.T) []logEntry {
+	t.Helper()
+	c.mu.Lock()
+	raw := c.buf.String()
+	c.mu.Unlock()
+	var out []logEntry
+	for _, line := range strings.Split(strings.TrimSpace(raw), "\n") {
+		if line == "" {
+			continue
+		}
+		var e logEntry
+		if err := json.Unmarshal([]byte(line), &e); err != nil {
+			t.Fatalf("unmarshal op log line %q: %v", line, err)
+		}
+		e.Raw = line
+		out = append(out, e)
+	}
+	return out
+}
+
+// find returns the single entry with the given message, failing when there is
+// not exactly one.
+func (c *logCapture) find(t *testing.T, msg string) logEntry {
+	t.Helper()
+	var got []logEntry
+	for _, e := range c.entries(t) {
+		if e.Msg == msg {
+			got = append(got, e)
+		}
+	}
+	if len(got) != 1 {
+		t.Fatalf("op log: %d lines with msg %q, want 1; log:\n%s", len(got), msg, c.dump(t))
+	}
+	return got[0]
+}
+
+func (c *logCapture) has(t *testing.T, msg string) bool {
+	t.Helper()
+	for _, e := range c.entries(t) {
+		if e.Msg == msg {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *logCapture) dump(t *testing.T) string {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
 }
 
 func newHarness(t *testing.T, ctrl *fakeController, m *manifest.Manifest) *harness {
+	t.Helper()
+	return newHarnessWith(t, ctrl, ctrl, m)
+}
+
+// newHarnessWith is newHarness for tests that need a RouterService
+// implementation other than the plain fake (e.g. one that fails AcquireSlot).
+// ctrl is the fake the harness reports on; srv is what is actually served.
+func newHarnessWith(t *testing.T, srv api.RouterServiceServer, ctrl *fakeController, m *manifest.Manifest) *harness {
 	t.Helper()
 	mem := memstorage.New()
 	store := newCountingStorage(mem)
@@ -254,26 +368,30 @@ func newHarness(t *testing.T, ctrl *fakeController, m *manifest.Manifest) *harne
 		seedManifest(t, store, m)
 	}
 	conn := startGRPC(t, func(s *grpc.Server) {
-		api.RegisterRouterServiceServer(s, ctrl)
+		api.RegisterRouterServiceServer(s, srv)
 	})
 	cache, err := staticcache.New(t.TempDir(), 1<<20)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var logbuf strings.Builder
+	oplog := newLogCapture()
 	rt, err := New(Options{
 		Resolver:        api.NewRouterServiceClient(conn),
 		Storage:         store,
 		Cache:           cache,
 		ResolveCacheTTL: 10 * time.Second,
 		LogWriter:       &logbuf,
-		Now:             func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
+		// Captured rather than left to default, so tests can assert on the
+		// operational log and do not spray slog.Default() over the test output.
+		Logger: oplog.logger,
+		Now:    func() time.Time { return time.Unix(1_700_000_000, 0).UTC() },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { rt.Close() })
-	return &harness{rt: rt, ctrl: ctrl, store: store, log: &logbuf}
+	return &harness{rt: rt, ctrl: ctrl, store: store, log: &logbuf, oplog: oplog}
 }
 
 func (h *harness) do(req *http.Request) *httptest.ResponseRecorder {

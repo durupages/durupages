@@ -49,9 +49,46 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(b)
 }
 
-// writeError renders the error envelope with the given status and code.
+// serverErrorRecorder is implemented by responseRecorder: it collects the
+// detail behind a 5xx reply so that ServeHTTP can log it server-side.
+type serverErrorRecorder interface {
+	recordServerError(msg string)
+}
+
+// maxUnwrapDepth bounds the walk down a chain of ResponseWriter wrappers.
+const maxUnwrapDepth = 8
+
+// recordServerError attaches the cause of a 5xx reply to the request log line.
+//
+// It is a best-effort, defensive hook: handlers normally see the Server's
+// responseRecorder, but a test may drive them with a bare
+// httptest.ResponseRecorder and a middleware may wrap the writer in its own
+// type, so anything that is neither the recorder nor an unwrappable wrapper
+// around it is simply skipped. The response is written either way.
+func recordServerError(w http.ResponseWriter, status int, msg string) {
+	if status < http.StatusInternalServerError {
+		return
+	}
+	for i := 0; i < maxUnwrapDepth; i++ {
+		if rec, ok := w.(serverErrorRecorder); ok {
+			rec.recordServerError(msg)
+			return
+		}
+		u, ok := w.(interface{ Unwrap() http.ResponseWriter })
+		if !ok {
+			return
+		}
+		w = u.Unwrap()
+	}
+}
+
+// writeError renders the error envelope with the given status and code. For a
+// 5xx it also records the message for the server-side request log, so that the
+// cause of a server fault is visible to the operator and not only to the
+// client that happened to make the request.
 func writeError(w http.ResponseWriter, status int, code, format string, args ...any) {
 	env := errorEnvelope{Error: errorBody{Code: code, Message: fmt.Sprintf(format, args...)}}
+	recordServerError(w, status, env.Error.Message)
 	b, err := json.Marshal(env)
 	if err != nil {
 		b = []byte(`{"error":{"code":"internal","message":"encode error"}}`)
@@ -63,7 +100,16 @@ func writeError(w http.ResponseWriter, status int, code, format string, args ...
 }
 
 // writeProviderError maps a provider error onto the envelope: ErrNotFound
-// becomes 404 with the caller's message, everything else 500.
+// becomes 404 with the caller's message, everything else 500 carrying the
+// provider's own message.
+//
+// That message stays in the 500 body on purpose. This API is served on a
+// private, operator-only port (see the package Security note) and the duru CLI
+// prints the envelope message verbatim, which is how faults like a read-only
+// upload directory get diagnosed at all; replacing it with a bare "internal
+// error" would only move the diagnosis to the controller's log without buying
+// any real confidentiality here. The same detail is now recorded server-side
+// too, so it is available even when nobody kept the client output.
 func writeProviderError(w http.ResponseWriter, err error, notFoundFormat string, args ...any) {
 	if errors.Is(err, provider.ErrNotFound) {
 		writeError(w, http.StatusNotFound, codeNotFound, notFoundFormat, args...)

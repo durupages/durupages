@@ -50,4 +50,12 @@ type ExistingPod struct {
 	TenantID string
 	// Labels is the pod's full label set.
 	Labels map[string]string
+	// Failed reports a pod whose container has already terminated with a
+	// non-zero exit and, since worker pods run with RestartPolicyNever, never
+	// will run again. It is a terminal, unambiguous signal: unlike a missing
+	// heartbeat (which just as easily means "hasn't gotten there yet" as "never
+	// will"), a failed pod cannot recover into a Ready one. See reconcile.go and
+	// scaleDownOnce for how it is used to exclude such pods immediately instead
+	// of waiting out an adoption or heartbeat window.
+	Failed bool
 }

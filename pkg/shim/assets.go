@@ -5,6 +5,7 @@ package shim
 
 import (
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -17,9 +18,12 @@ import (
 // service injects X-DuruPages-Page, which selects the loaded deployment whose
 // static tree and manifest drive Cloudflare Pages asset resolution (pkg/assets).
 func (s *Shim) serveAssets(w http.ResponseWriter, r *http.Request) {
+	requestID := requestIDOf(r)
 	pageID := r.Header.Get(api.HeaderPage)
 	if pageID == "" {
-		http.Error(w, "missing page header", http.StatusBadRequest)
+		s.httpError(w, r, http.StatusBadRequest, "missing page header", logMsgAssetsFailed,
+			attrIf([]slog.Attr{slog.String("reason", "no "+api.HeaderPage+" header")},
+				"requestId", requestID)...)
 		return
 	}
 
@@ -28,7 +32,15 @@ func (s *Shim) serveAssets(w http.ResponseWriter, r *http.Request) {
 	dep := s.deployments[depID]
 	s.mu.Unlock()
 	if dep == nil || dep.manifest == nil {
+		// The runtime asked for a page the shim is not serving: a stale workerd
+		// config, or a swap that dropped the page from the load set.
 		http.NotFound(w, r)
+		s.logResponseErr(r, http.StatusNotFound, logMsgAssetsFailed,
+			attrIf([]slog.Attr{
+				slog.String("pageId", pageID),
+				slog.String("deploymentId", depID),
+				slog.String("reason", "page not in load set"),
+			}, "requestId", requestID)...)
 		return
 	}
 
@@ -39,7 +51,15 @@ func (s *Shim) serveAssets(w http.ResponseWriter, r *http.Request) {
 	case assets.ServeFile:
 		s.serveAssetFile(w, r, dep, res)
 	default:
+		// A plain miss in the static manifest: normal for worker-handled paths,
+		// so this stays at warn like every other 4xx and carries no error.
 		http.NotFound(w, r)
+		s.logResponseErr(r, http.StatusNotFound, logMsgAssetsFailed,
+			attrIf([]slog.Attr{
+				slog.String("pageId", pageID),
+				slog.String("deploymentId", dep.deploymentID),
+				slog.String("reason", "no manifest entry"),
+			}, "requestId", requestID)...)
 	}
 }
 
@@ -62,7 +82,16 @@ func (s *Shim) serveAssetFile(w http.ResponseWriter, r *http.Request, dep *deplo
 
 	f, err := os.Open(filepath.Join(dep.staticDir, res.Entry.Hash))
 	if err != nil {
+		// The manifest promised a blob the unpacked bundle does not have: a
+		// truncated download or a bundle/manifest mismatch, worth the detail.
 		http.NotFound(w, r)
+		s.logResponseErr(r, http.StatusNotFound, logMsgAssetsFailed,
+			attrIf([]slog.Attr{
+				slog.String("pageId", dep.pageID),
+				slog.String("deploymentId", dep.deploymentID),
+				slog.String("reason", "static blob missing on disk"),
+				slog.String("error", err.Error()),
+			}, "requestId", requestIDOf(r))...)
 		return
 	}
 	defer f.Close()

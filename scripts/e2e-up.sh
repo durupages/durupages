@@ -17,6 +17,14 @@ cd "${REPO_ROOT}"
 mkdir -p "${KEYS_DIR}" "${KUBE_DIR}" "${BUILD_DIR}"
 
 # ---------------------------------------------------------------------------
+# 0. TLS material, when the run is a TLS run. Generated before anything starts
+#    so the containers find it mounted on first boot.
+# ---------------------------------------------------------------------------
+if [[ "${E2E_TLS}" == "1" ]]; then
+  "${SCRIPT_DIR}/e2e-certs.sh"
+fi
+
+# ---------------------------------------------------------------------------
 # 1. Worker JWT keypair (Ed25519). Controller signs, hub verifies.
 # ---------------------------------------------------------------------------
 if [[ ! -f "${KEYS_DIR}/jwt-priv.pem" ]]; then
@@ -110,4 +118,8 @@ for _ in $(seq 1 60); do
   sleep 1
 done
 
-log "Stack is up. Router at ${ROUTER_URL} (Host: <page>.${PAGES_DOMAIN})"
+if [[ "${E2E_TLS}" == "1" ]]; then
+  log "Stack is up WITH TLS between components. Router at ${ROUTER_URL} (Host: <page>.${PAGES_DOMAIN})"
+else
+  log "Stack is up (plaintext). Router at ${ROUTER_URL} (Host: <page>.${PAGES_DOMAIN})"
+fi

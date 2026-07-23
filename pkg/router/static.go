@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strconv"
@@ -22,9 +23,11 @@ import (
 // serveStatic runs the static pipeline of docs/ARCHITECTURE.md 3.1/5.2:
 // _redirects, asset resolution, _headers + default headers, ETag/304, and the
 // 404/SPA fallback. Only GET and HEAD are accepted here.
-func (rt *Router) serveStatic(w http.ResponseWriter, r *http.Request, host string, page *api.PageInfo, m *manifest.Manifest) {
+func (rt *Router) serveStatic(w http.ResponseWriter, r *http.Request, rl *reqLog, host string, page *api.PageInfo, m *manifest.Manifest) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
+		rt.logEvent(r, rl, slog.LevelWarn, msgMethodNotAllowed,
+			slog.Int("status", http.StatusMethodNotAllowed))
 		http.Error(w, "405 method not allowed", http.StatusMethodNotAllowed)
 		rt.logStatic(r, host, page, http.StatusMethodNotAllowed, 0)
 		return
@@ -54,8 +57,17 @@ func (rt *Router) serveStatic(w http.ResponseWriter, r *http.Request, host strin
 		rt.writeRedirect(w, r, result.Location, result.Status)
 		rt.logStatic(r, host, page, result.Status, 0)
 	case assets.ServeFile:
-		rt.serveFile(w, r, host, page, m, result)
+		rt.serveFile(w, r, rl, host, page, m, result)
 	default: // assets.NotFound: nothing to serve.
+		// Info, not warn: a deployment with no matching asset and no
+		// 404.html/SPA fallback is an ordinary outcome (favicon.ico, stale
+		// links, crawlers) on any site, so warn-level here would be pure noise
+		// and would devalue the warn lines that do need attention. It is still
+		// emitted at the default level, because "my page 404s" is a question an
+		// operator has to answer from the log.
+		rt.logEvent(r, rl, slog.LevelInfo, msgStaticNotFound,
+			slog.Int("status", http.StatusNotFound),
+			slog.String("resolvePath", resolvePath))
 		body := "404 page not found\n"
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusNotFound)
@@ -81,7 +93,7 @@ func (rt *Router) writeRedirect(w http.ResponseWriter, r *http.Request, location
 // custom 404.html served as an error page). It applies default and _headers
 // rules, honors If-None-Match, and streams the body from the LRU cache (filling
 // it from Storage on a miss).
-func (rt *Router) serveFile(w http.ResponseWriter, r *http.Request, host string, page *api.PageInfo, m *manifest.Manifest, result assets.Result) {
+func (rt *Router) serveFile(w http.ResponseWriter, r *http.Request, rl *reqLog, host string, page *api.PageInfo, m *manifest.Manifest, result assets.Result) {
 	entry := result.Entry
 	header := w.Header()
 
@@ -117,6 +129,14 @@ func (rt *Router) serveFile(w http.ResponseWriter, r *http.Request, host string,
 
 	body, err := rt.openBody(r.Context(), page, entry.Hash)
 	if err != nil {
+		// The manifest promises this asset but the cache and Storage could not
+		// produce it: an incomplete upload, an object deleted behind the
+		// manifest, or an unusable cache directory. The wrapped error names the
+		// storage key.
+		rt.logEvent(r, rl, slog.LevelError, msgStaticFetch,
+			slog.Int("status", http.StatusBadGateway),
+			slog.String("assetHash", entry.Hash),
+			slog.Any("error", err))
 		http.Error(w, "502 bad gateway", http.StatusBadGateway)
 		return
 	}
@@ -145,12 +165,14 @@ func (rt *Router) openBody(ctx context.Context, page *api.PageInfo, hash string)
 	key := fmt.Sprintf(storage.StaticKeyFmt, page.GetTenantId(), page.GetPageId(), page.GetActiveDeploymentId(), hash)
 	rc, _, err := rt.storage.Get(ctx, key)
 	if err != nil {
-		return nil, err
+		// Wrapped so the operational log names the object that was missing or
+		// unreadable, and says which of the two steps failed.
+		return nil, fmt.Errorf("get %s: %w", key, err)
 	}
 	path, err := rt.cache.Put(hash, rc)
 	rc.Close()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cache %s: %w", key, err)
 	}
 	return os.Open(path)
 }

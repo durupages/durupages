@@ -13,7 +13,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/base64"
+	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"os"
 	"os/signal"
@@ -22,6 +24,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/durupages/durupages/internal/version"
@@ -29,6 +32,20 @@ import (
 	"github.com/durupages/durupages/pkg/runtime/workerdruntime"
 	"github.com/durupages/durupages/pkg/shim"
 )
+
+// setupLogging installs the process-wide structured logger on stderr, matching
+// durupages-controller so every component emits the same JSON shape. Setting it
+// as the slog default also routes the standard log package (used for the
+// startup fatals below) through the same handler, and lets any shim internals
+// that fall back to slog.Default() land here.
+//
+// stderr, not stdout: stdout is the tenant-facing pod log (usage events as JSON
+// lines), and the shim's own operational logs must not be mixed into it.
+func setupLogging() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+}
 
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
@@ -85,6 +102,7 @@ func proxyAdvertiseAddr() string {
 
 func main() {
 	version.MaybePrint()
+	setupLogging()
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -95,13 +113,31 @@ func main() {
 	workerJWT := os.Getenv("DURUPAGES_WORKER_JWT")
 	leasePub := os.Getenv("DURUPAGES_LEASE_PUBKEY")
 	if tenantID == "" || podName == "" || controllerAddr == "" || hubAddr == "" || workerJWT == "" || leasePub == "" {
-		log.Fatal("durupages-worker-shim: DURUPAGES_TENANT_ID/POD_NAME/CONTROLLER_ADDR/HUB_ADDR/WORKER_JWT/LEASE_PUBKEY are required")
+		fatalf("durupages-worker-shim: DURUPAGES_TENANT_ID/POD_NAME/CONTROLLER_ADDR/HUB_ADDR/WORKER_JWT/LEASE_PUBKEY are required")
 	}
 	// The controller encodes the key with raw (unpadded) std encoding.
 	pubRaw, err := base64.RawStdEncoding.DecodeString(leasePub)
 	if err != nil || len(pubRaw) != ed25519.PublicKeySize {
-		log.Fatalf("durupages-worker-shim: invalid DURUPAGES_LEASE_PUBKEY: %v", err)
+		fatalf("durupages-worker-shim: invalid DURUPAGES_LEASE_PUBKEY: %v", err)
 	}
+
+	// Transport security, if any, is decided here rather than inside pkg/shim:
+	// the shim library takes ready-made *tls.Config values so that reading the
+	// environment stays in the command.
+	logAddr := os.Getenv("DURUPAGES_HUB_LOG_ADDR")
+	controllerTLS, err := clientTLS(controllerAddr, envBool(envControllerTLS), envControllerServerName)
+	if err != nil {
+		fatalf("durupages-worker-shim: controller TLS: %v", err)
+	}
+	hubTLS, err := clientTLS(hubAddr, hubTLSEnabled(hubAddr), envHubServerName)
+	if err != nil {
+		fatalf("durupages-worker-shim: hub TLS: %v", err)
+	}
+	hubLogTLS, err := clientTLS(logAddr, logAddr != "" && envBool(envHubLogTLS), envHubLogServerName)
+	if err != nil {
+		fatalf("durupages-worker-shim: hub log TLS: %v", err)
+	}
+	logTLSStatus(controllerTLS, hubTLS, hubLogTLS)
 
 	bundleDir := envOr("DURUPAGES_BUNDLE_DIR", "/bundles")
 	workDir := envOr("DURUPAGES_RUNTIME_WORKDIR", bundleDir+"/.runtime")
@@ -130,15 +166,26 @@ func main() {
 		MinIdle:       envDuration("DURUPAGES_BUNDLE_MIN_IDLE", time.Hour),
 		CacheMaxBytes: envInt64("DURUPAGES_BUNDLE_CACHE_MAX_BYTES", 2<<30),
 		SweepInterval: envDuration("DURUPAGES_BUNDLE_SWEEP_INTERVAL", 5*time.Minute),
-		LogWriter:     os.Stdout,
+		// LogWriter is the tenant-facing pod log (usage events) on stdout;
+		// Logger is the shim's own operational log on stderr. Two different
+		// streams on purpose.
+		LogWriter: os.Stdout,
+		Logger:    slog.Default(),
+
+		ControllerTLS: controllerTLS,
+		HubTLS:        hubTLS,
 	}
 
 	// Log ingest is enabled when the controller propagates the hub's log
 	// address; otherwise the shim stays in pod-log mode.
-	if logAddr := os.Getenv("DURUPAGES_HUB_LOG_ADDR"); logAddr != "" {
-		conn, err := grpc.NewClient(logAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if logAddr != "" {
+		creds := insecure.NewCredentials()
+		if hubLogTLS != nil {
+			creds = credentials.NewTLS(hubLogTLS)
+		}
+		conn, err := grpc.NewClient(logAddr, grpc.WithTransportCredentials(creds))
 		if err != nil {
-			log.Fatalf("durupages-worker-shim: hub log dial: %v", err)
+			fatalf("durupages-worker-shim: hub log dial: %v", err)
 		}
 		defer conn.Close()
 		opts.LogClient = api.NewLogServiceClient(conn)
@@ -146,9 +193,18 @@ func main() {
 
 	s, err := shim.New(opts)
 	if err != nil {
-		log.Fatalf("durupages-worker-shim: %v", err)
+		fatalf("durupages-worker-shim: %v", err)
 	}
 	if err := s.Run(ctx); err != nil && ctx.Err() == nil {
-		log.Fatalf("durupages-worker-shim: %v", err)
+		fatalf("durupages-worker-shim: %v", err)
 	}
+}
+
+// fatalf reports a startup failure and exits. It exists because log.Fatalf
+// routes through the slog bridge installed by setupLogging and lands at INFO,
+// filing the failure that kills the process under the same level as routine
+// progress -- exactly where an operator scanning for errors will not look.
+func fatalf(format string, args ...any) {
+	slog.Error(fmt.Sprintf(format, args...))
+	os.Exit(1)
 }

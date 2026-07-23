@@ -12,9 +12,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
@@ -37,23 +40,38 @@ import (
 	"github.com/durupages/durupages/pkg/scaler/defaultscaler"
 	"github.com/durupages/durupages/pkg/storage"
 	"github.com/durupages/durupages/pkg/storage/s3"
+	"github.com/durupages/durupages/pkg/tlsconf"
 	"github.com/durupages/durupages/pkg/workerauth"
 )
 
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
+// getenv is the environment lookup used while resolving configuration. It is a
+// parameter rather than a direct os.Getenv call so parseConfig is testable.
+type getenv func(string) string
+
+func envOr(env getenv, key, def string) string {
+	if v := env(key); v != "" {
 		return v
 	}
 	return def
 }
 
-func envOrInt64(key string, def int64) int64 {
-	if v := os.Getenv(key); v != "" {
+func envOrInt64(env getenv, key string, def int64) int64 {
+	if v := env(key); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
 			return n
 		}
 	}
 	return def
+}
+
+// envBool reads a boolean env var, reporting whether it was set at all so a
+// caller can tell "explicitly false" from "not configured".
+func envBool(env getenv, key string) (value, set bool) {
+	v := env(key)
+	if v == "" {
+		return false, false
+	}
+	return v == "true" || v == "1", true
 }
 
 // config is the resolved controller configuration.
@@ -64,9 +82,29 @@ type config struct {
 	migrate       bool
 	signingKeyPEM string
 
-	controllerAddr string
-	hubAddr        string
-	hubLogAddr     string
+	// TLS for this process's own listeners. Empty pair = plaintext.
+	tlsCertFile string
+	tlsKeyFile  string
+	// Admin API certificate, defaulted to the pair above.
+	adminTLSCertFile string
+	adminTLSKeyFile  string
+
+	// Advertised addresses: what workers are told to dial, which is not
+	// necessarily what this process binds (--listen) -- a worker reaches the
+	// controller through a Service, not through the controller's own bind
+	// address.
+	controllerAdvertiseAddr string
+	hubAdvertiseAddr        string
+	hubLogAdvertiseAddr     string
+
+	// Advertised TLS facts about those endpoints, likewise propagated to
+	// workers rather than used here.
+	workerCACertFile       string
+	advertiseControllerTLS bool
+	advertiseHubLogTLS     bool
+	controllerAdvertiseSNI string
+	hubAdvertiseSNI        string
+	hubLogAdvertiseSNI     string
 
 	kubeconfig      string
 	workerNamespace string
@@ -74,6 +112,10 @@ type config struct {
 	workerSA        string
 	workerCPULimit  string
 	workerMemLimit  string
+	// workerPodOverridesFile holds cluster-wide worker pod configuration (node
+	// selector, tolerations, affinity, DNS, priority, annotations, labels) as a
+	// controller.WorkerPodOverrides-shaped YAML file. Empty = none.
+	workerPodOverridesFile string
 
 	defaults       controller.Defaults
 	bundleMinIdle  string
@@ -83,59 +125,185 @@ type config struct {
 	adminEnabled   bool
 	adminListen    string
 	adminMaxUpload int64
+	adminTempDir   string
 	s3             s3.Options
+}
+
+// setupLogging installs a JSON slog handler on stderr as the process default.
+//
+// slog.SetDefault also redirects the standard log package through this
+// handler, so the log.Printf calls in this binary and the admin API's
+// structured request lines end up in one consistent JSON stream instead of two
+// competing formats.
+func setupLogging() {
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
 }
 
 func main() {
 	version.MaybePrint()
+	setupLogging()
+	cfg, err := parseConfig(os.Args[1:], os.Getenv)
+	if errors.Is(err, flag.ErrHelp) {
+		return // -h already printed the usage
+	}
+	if err != nil {
+		fatalf("durupages-controller: %v", err)
+	}
+	if err := run(cfg); err != nil {
+		fatalf("durupages-controller: %v", err)
+	}
+}
+
+// renamedEnv lists environment variables the controller no longer reads.
+//
+// DURUPAGES_HUB_ADDR / DURUPAGES_HUB_LOG_ADDR kept their names in the worker
+// pod environment -- a worker really does dial those -- but as controller input
+// they only ever described what to advertise, which the ADVERTISE names now say
+// outright. Since the two sets of names would otherwise be
+// indistinguishable in a manifest, an old name left behind is rejected rather
+// than ignored: silently ignoring DURUPAGES_HUB_LOG_ADDR would drop workers
+// into pod-log mode with no clue why, and the failure would only surface as
+// missing logs long after the upgrade.
+var renamedEnv = []struct{ old, new string }{
+	{"DURUPAGES_HUB_ADDR", "DURUPAGES_HUB_ADVERTISE_ADDR"},
+	{"DURUPAGES_HUB_LOG_ADDR", "DURUPAGES_HUB_LOG_ADVERTISE_ADDR"},
+}
+
+// parseConfig resolves flags (highest priority), environment and defaults into
+// a config. It returns an error instead of exiting so it can be tested.
+func parseConfig(args []string, env getenv) (config, error) {
+	fs := flag.NewFlagSet("durupages-controller", flag.ContinueOnError)
 	var (
-		listen        = flag.String("listen", envOr("DURUPAGES_LISTEN", ":9440"), "gRPC listen address")
-		pgDSN         = flag.String("pg-dsn", envOr("DURUPAGES_PG_DSN", ""), "PostgreSQL DSN (required)")
-		pagesDomain   = flag.String("pages-domain", envOr("DURUPAGES_PAGES_DOMAIN", "pages.local"), "pages domain")
-		migrate       = flag.Bool("migrate", envOr("DURUPAGES_MIGRATE", "true") == "true", "apply schema migrations on start")
-		signingKeyPEM = flag.String("worker-jwt-signing-key", envOr("DURUPAGES_WORKER_JWT_SIGNING_KEY", ""), "path to ed25519 private key PEM (required)")
+		listen        = fs.String("listen", envOr(env, "DURUPAGES_LISTEN", ":9440"), "gRPC listen address")
+		pgDSN         = fs.String("pg-dsn", envOr(env, "DURUPAGES_PG_DSN", ""), "PostgreSQL DSN (required)")
+		pagesDomain   = fs.String("pages-domain", envOr(env, "DURUPAGES_PAGES_DOMAIN", "pages.local"), "pages domain")
+		migrate       = fs.Bool("migrate", envOr(env, "DURUPAGES_MIGRATE", "true") == "true", "apply schema migrations on start")
+		signingKeyPEM = fs.String("worker-jwt-signing-key", envOr(env, "DURUPAGES_WORKER_JWT_SIGNING_KEY", ""), "path to ed25519 private key PEM (required)")
 
-		controllerAddr = flag.String("controller-addr", envOr("DURUPAGES_CONTROLLER_ADVERTISE_ADDR", ""), "address workers use to reach this controller (required)")
-		hubAddr        = flag.String("hub-addr", envOr("DURUPAGES_HUB_ADDR", ""), "hub bundle address propagated to workers (required)")
-		hubLogAddr     = flag.String("hub-log-addr", envOr("DURUPAGES_HUB_LOG_ADDR", ""), "hub log ingest address propagated to workers (empty = pod-log mode)")
+		tlsCertFile      = fs.String("tls-cert-file", envOr(env, "DURUPAGES_TLS_CERT_FILE", ""), "PEM certificate for the gRPC listener (empty = plaintext)")
+		tlsKeyFile       = fs.String("tls-key-file", envOr(env, "DURUPAGES_TLS_KEY_FILE", ""), "PEM private key for the gRPC listener")
+		adminTLSCertFile = fs.String("admin-tls-cert-file", envOr(env, "DURUPAGES_ADMIN_TLS_CERT_FILE", ""), "PEM certificate for the admin API (empty = reuse --tls-cert-file)")
+		adminTLSKeyFile  = fs.String("admin-tls-key-file", envOr(env, "DURUPAGES_ADMIN_TLS_KEY_FILE", ""), "PEM private key for the admin API (empty = reuse --tls-key-file)")
 
-		kubeconfig      = flag.String("kubeconfig", envOr("KUBECONFIG", ""), "kubeconfig path (empty = in-cluster)")
-		workerNamespace = flag.String("worker-namespace", envOr("DURUPAGES_WORKER_NAMESPACE", "durupages-workers"), "namespace for worker pods")
-		workerImage     = flag.String("worker-image", envOr("DURUPAGES_WORKER_IMAGE", ""), "worker image (shim + workerd) (required)")
-		workerSA        = flag.String("worker-service-account", envOr("DURUPAGES_WORKER_SA", "durupages-worker-noperm"), "worker pod service account")
-		workerCPULimit  = flag.String("worker-cpu-limit", envOr("DURUPAGES_WORKER_CPU_LIMIT", "1"), "default worker pod CPU limit")
-		workerMemLimit  = flag.String("worker-mem-limit", envOr("DURUPAGES_WORKER_MEM_LIMIT", "512Mi"), "default worker pod memory limit")
+		controllerAdvertiseAddr = fs.String("controller-addr", envOr(env, "DURUPAGES_CONTROLLER_ADVERTISE_ADDR", ""), "address workers use to reach this controller (required)")
+		hubAdvertiseAddr        = fs.String("hub-advertise-addr", envOr(env, "DURUPAGES_HUB_ADVERTISE_ADDR", ""), "hub bundle URL propagated to workers; an https:// scheme is how workers learn the hub speaks TLS (required)")
+		hubLogAdvertiseAddr     = fs.String("hub-log-advertise-addr", envOr(env, "DURUPAGES_HUB_LOG_ADVERTISE_ADDR", ""), "hub log ingest address propagated to workers (empty = pod-log mode)")
 
-		defQueueTimeout   = flag.Duration("default-queue-timeout", 30*time.Second, "default per-page queue timeout")
-		maxQueueTimeout   = flag.Duration("max-queue-timeout", 120*time.Second, "max per-page queue timeout")
-		defRequestTimeout = flag.Duration("default-request-timeout", 60*time.Second, "default request timeout")
-		defMaxConcurrency = flag.Int("default-max-concurrency", 5, "default max worker pods per tenant")
-		maxConcPerPod     = flag.Int("max-concurrency-per-pod", 256, "per-pod in-flight hard cap")
-		targetConcPerPod  = flag.Int("target-concurrency-per-pod", 32, "per-pod scale-up target concurrency")
-		defIdleTTL        = flag.Duration("default-idle-ttl", 60*time.Second, "default idle TTL before scale-down")
+		// These five carry the worker-facing env names unchanged: the controller
+		// does not use them, it restates them verbatim to the pods it creates,
+		// and a second spelling for the same value would only invite the two to
+		// drift apart in a manifest. The flags say "advertise" because on a
+		// command line there is no such context.
+		workerCACertFile       = fs.String("worker-ca-cert-file", envOr(env, "DURUPAGES_WORKER_CA_CERT_FILE", ""), "PEM CA bundle handed to worker pods as DURUPAGES_CA_CERT_PEM; re-read per pod creation so rotations reach new pods")
+		advertiseHubLogTLS     = fs.Bool("advertise-hub-log-tls", boolDefault(env, "DURUPAGES_HUB_LOG_TLS", false), "tell workers the hub log endpoint serves TLS")
+		controllerAdvertiseSNI = fs.String("advertise-controller-server-name", envOr(env, "DURUPAGES_CONTROLLER_SERVER_NAME", ""), "server name workers verify in the controller certificate (empty = derived from the advertised address)")
+		hubAdvertiseSNI        = fs.String("advertise-hub-server-name", envOr(env, "DURUPAGES_HUB_SERVER_NAME", ""), "server name workers verify in the hub certificate (empty = derived)")
+		hubLogAdvertiseSNI     = fs.String("advertise-hub-log-server-name", envOr(env, "DURUPAGES_HUB_LOG_SERVER_NAME", ""), "server name workers verify in the hub log certificate (empty = derived)")
+		// Default resolved after parsing: see below.
+		advertiseControllerTLS = fs.Bool("advertise-controller-tls", false, "tell workers this controller serves TLS (default: whether --tls-cert-file is set)")
 
-		bundleMinIdle  = flag.String("worker-bundle-min-idle", envOr("DURUPAGES_BUNDLE_MIN_IDLE", ""), "worker bundle LRU min idle (propagated)")
-		bundleCacheMax = flag.String("worker-bundle-cache-max-bytes", envOr("DURUPAGES_BUNDLE_CACHE_MAX_BYTES", ""), "worker bundle cache limit (propagated)")
+		kubeconfig      = fs.String("kubeconfig", envOr(env, "KUBECONFIG", ""), "kubeconfig path (empty = in-cluster)")
+		workerNamespace = fs.String("worker-namespace", envOr(env, "DURUPAGES_WORKER_NAMESPACE", "durupages-workers"), "namespace for worker pods")
+		workerImage     = fs.String("worker-image", envOr(env, "DURUPAGES_WORKER_IMAGE", ""), "worker image (shim + workerd) (required)")
+		workerSA        = fs.String("worker-service-account", envOr(env, "DURUPAGES_WORKER_SA", "durupages-worker-noperm"), "worker pod service account")
+		workerCPULimit  = fs.String("worker-cpu-limit", envOr(env, "DURUPAGES_WORKER_CPU_LIMIT", "1"), "default worker pod CPU limit")
+		workerMemLimit  = fs.String("worker-mem-limit", envOr(env, "DURUPAGES_WORKER_MEM_LIMIT", "512Mi"), "default worker pod memory limit")
+		// Read once at startup: the file is a mounted ConfigMap whose change
+		// restarts this pod anyway.
+		workerPodOverridesFile = fs.String("worker-pod-overrides-file", envOr(env, "DURUPAGES_WORKER_POD_OVERRIDES_FILE", ""),
+			"YAML file (controller.WorkerPodOverrides shape: nodeSelector, tolerations, affinity, dnsPolicy, dnsConfig, "+
+				"priorityClassName, runtimeClassName, annotations, labels) applied to every worker pod; "+
+				"annotations/labels win over a tenant's own PodAnnotations/PodLabels (empty = none)")
 
-		adminEnabled   = flag.Bool("admin-enabled", envOr("DURUPAGES_ADMIN_ENABLED", "false") == "true", "enable the unauthenticated admin API on --admin-listen")
-		adminListen    = flag.String("admin-listen", envOr("DURUPAGES_ADMIN_LISTEN", ":9450"), "admin API listen address (separate port)")
-		adminMaxUpload = flag.Int64("admin-max-upload-bytes", envOrInt64("DURUPAGES_ADMIN_MAX_UPLOAD_BYTES", 512<<20), "admin API deployment upload size limit")
+		defQueueTimeout   = fs.Duration("default-queue-timeout", 30*time.Second, "default per-page queue timeout")
+		maxQueueTimeout   = fs.Duration("max-queue-timeout", 120*time.Second, "max per-page queue timeout")
+		defRequestTimeout = fs.Duration("default-request-timeout", 60*time.Second, "default request timeout")
+		defMaxConcurrency = fs.Int("default-max-concurrency", 5, "default max worker pods per tenant")
+		maxConcPerPod     = fs.Int("max-concurrency-per-pod", 256, "per-pod in-flight hard cap")
+		targetConcPerPod  = fs.Int("target-concurrency-per-pod", 32, "per-pod scale-up target concurrency")
+		defIdleTTL        = fs.Duration("default-idle-ttl", 60*time.Second, "default idle TTL before scale-down")
 
-		s3Endpoint  = flag.String("s3-endpoint", envOr("DURUPAGES_S3_ENDPOINT", ""), "S3 endpoint (admin API uploads)")
-		s3Region    = flag.String("s3-region", envOr("DURUPAGES_S3_REGION", "us-east-1"), "S3 region (admin API uploads)")
-		s3Bucket    = flag.String("s3-bucket", envOr("DURUPAGES_S3_BUCKET", ""), "S3 bucket (required when the admin API is enabled)")
-		s3AccessKey = flag.String("s3-access-key", envOr("DURUPAGES_S3_ACCESS_KEY", ""), "S3 access key (admin API uploads)")
-		s3SecretKey = flag.String("s3-secret-key", envOr("DURUPAGES_S3_SECRET_KEY", ""), "S3 secret key (admin API uploads)")
-		s3PathStyle = flag.Bool("s3-path-style", envOr("DURUPAGES_S3_PATH_STYLE", "true") == "true", "path-style S3 addressing (admin API uploads)")
+		bundleMinIdle  = fs.String("worker-bundle-min-idle", envOr(env, "DURUPAGES_BUNDLE_MIN_IDLE", ""), "worker bundle LRU min idle (propagated)")
+		bundleCacheMax = fs.String("worker-bundle-cache-max-bytes", envOr(env, "DURUPAGES_BUNDLE_CACHE_MAX_BYTES", ""), "worker bundle cache limit (propagated)")
+
+		adminEnabled   = fs.Bool("admin-enabled", envOr(env, "DURUPAGES_ADMIN_ENABLED", "false") == "true", "enable the unauthenticated admin API on --admin-listen")
+		adminListen    = fs.String("admin-listen", envOr(env, "DURUPAGES_ADMIN_LISTEN", ":9450"), "admin API listen address (separate port)")
+		adminMaxUpload = fs.Int64("admin-max-upload-bytes", envOrInt64(env, "DURUPAGES_ADMIN_MAX_UPLOAD_BYTES", 512<<20), "admin API deployment upload size limit")
+		adminTempDir   = fs.String("admin-temp-dir", envOr(env, "DURUPAGES_ADMIN_TEMP_DIR", ""), "directory for admin API upload extraction (empty = os.TempDir(); set to a writable volume when the root filesystem is read-only)")
+
+		s3Endpoint  = fs.String("s3-endpoint", envOr(env, "DURUPAGES_S3_ENDPOINT", ""), "S3 endpoint (admin API uploads)")
+		s3Region    = fs.String("s3-region", envOr(env, "DURUPAGES_S3_REGION", "us-east-1"), "S3 region (admin API uploads)")
+		s3Bucket    = fs.String("s3-bucket", envOr(env, "DURUPAGES_S3_BUCKET", ""), "S3 bucket (required when the admin API is enabled)")
+		s3AccessKey = fs.String("s3-access-key", envOr(env, "DURUPAGES_S3_ACCESS_KEY", ""), "S3 access key (admin API uploads)")
+		s3SecretKey = fs.String("s3-secret-key", envOr(env, "DURUPAGES_S3_SECRET_KEY", ""), "S3 secret key (admin API uploads)")
+		s3PathStyle = fs.Bool("s3-path-style", envOr(env, "DURUPAGES_S3_PATH_STYLE", "true") == "true", "path-style S3 addressing (admin API uploads)")
 	)
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		return config{}, err
+	}
+
+	for _, r := range renamedEnv {
+		if env(r.old) != "" {
+			return config{}, fmt.Errorf("%s is no longer read by the controller: rename it to %s "+
+				"(%s remains the name injected into worker pods)", r.old, r.new, r.old)
+		}
+	}
+	// The annotations-only file was generalized into the broader
+	// WorkerPodOverrides shape (node selector, tolerations, affinity, DNS,
+	// priority, plus annotations/labels), not just renamed, so the message
+	// says so rather than reusing the "advertise" wording above -- there is no
+	// worker-facing env of this name to point to.
+	if env("DURUPAGES_WORKER_ANNOTATIONS_FILE") != "" {
+		return config{}, fmt.Errorf("DURUPAGES_WORKER_ANNOTATIONS_FILE is no longer read by the controller: " +
+			"its flat annotations-only format was replaced by DURUPAGES_WORKER_POD_OVERRIDES_FILE, " +
+			"a YAML file also accepting nodeSelector/tolerations/affinity/dnsPolicy/dnsConfig/" +
+			"priorityClassName/runtimeClassName/labels")
+	}
+
+	// Whether the controller serves TLS to workers is nearly always "yes if it
+	// serves TLS at all", so derive it and let the flag override -- a TLS
+	// terminating proxy in front of the controller is the case that needs the
+	// override, in either direction.
+	if !flagSet(fs, "advertise-controller-tls") {
+		if v, ok := envBool(env, "DURUPAGES_CONTROLLER_TLS"); ok {
+			*advertiseControllerTLS = v
+		} else {
+			*advertiseControllerTLS = *tlsCertFile != ""
+		}
+	}
+
+	// The admin API shares the gRPC certificate unless given its own; a lone
+	// admin cert or key is a typo, not a configuration.
+	adminCert, adminKey := *adminTLSCertFile, *adminTLSKeyFile
+	if adminCert == "" && adminKey == "" {
+		adminCert, adminKey = *tlsCertFile, *tlsKeyFile
+	}
+	if err := checkPair("--tls-cert-file", *tlsCertFile, "--tls-key-file", *tlsKeyFile); err != nil {
+		return config{}, err
+	}
+	if err := checkPair("--admin-tls-cert-file", adminCert, "--admin-tls-key-file", adminKey); err != nil {
+		return config{}, err
+	}
 
 	cfg := config{
 		listen: *listen, pgDSN: *pgDSN, pagesDomain: *pagesDomain, migrate: *migrate,
-		signingKeyPEM:  *signingKeyPEM,
-		controllerAddr: *controllerAddr, hubAddr: *hubAddr, hubLogAddr: *hubLogAddr,
-		kubeconfig: *kubeconfig, workerNamespace: *workerNamespace, workerImage: *workerImage,
+		signingKeyPEM: *signingKeyPEM,
+		tlsCertFile:   *tlsCertFile, tlsKeyFile: *tlsKeyFile,
+		adminTLSCertFile: adminCert, adminTLSKeyFile: adminKey,
+		controllerAdvertiseAddr: *controllerAdvertiseAddr,
+		hubAdvertiseAddr:        *hubAdvertiseAddr,
+		hubLogAdvertiseAddr:     *hubLogAdvertiseAddr,
+		workerCACertFile:        *workerCACertFile,
+		advertiseControllerTLS:  *advertiseControllerTLS,
+		advertiseHubLogTLS:      *advertiseHubLogTLS,
+		controllerAdvertiseSNI:  *controllerAdvertiseSNI,
+		hubAdvertiseSNI:         *hubAdvertiseSNI,
+		hubLogAdvertiseSNI:      *hubLogAdvertiseSNI,
+		kubeconfig:              *kubeconfig, workerNamespace: *workerNamespace, workerImage: *workerImage,
 		workerSA: *workerSA, workerCPULimit: *workerCPULimit, workerMemLimit: *workerMemLimit,
+		workerPodOverridesFile: *workerPodOverridesFile,
 		defaults: controller.Defaults{
 			QueueTimeout: *defQueueTimeout, MaxQueueTimeout: *maxQueueTimeout,
 			RequestTimeout: *defRequestTimeout, MaxConcurrency: *defMaxConcurrency,
@@ -144,19 +312,49 @@ func main() {
 		},
 		bundleMinIdle: *bundleMinIdle, bundleCacheMax: *bundleCacheMax,
 		adminEnabled: *adminEnabled, adminListen: *adminListen, adminMaxUpload: *adminMaxUpload,
+		adminTempDir: *adminTempDir,
 		s3: s3.Options{Endpoint: *s3Endpoint, Region: *s3Region, Bucket: *s3Bucket,
 			AccessKey: *s3AccessKey, SecretKey: *s3SecretKey, UsePathStyle: *s3PathStyle},
 	}
-	if err := run(cfg); err != nil {
-		log.Fatalf("durupages-controller: %v", err)
+	if cfg.pgDSN == "" || cfg.signingKeyPEM == "" || cfg.controllerAdvertiseAddr == "" ||
+		cfg.hubAdvertiseAddr == "" || cfg.workerImage == "" {
+		return config{}, fmt.Errorf("--pg-dsn, --worker-jwt-signing-key, --controller-addr, " +
+			"--hub-advertise-addr and --worker-image are required")
 	}
+	return cfg, nil
+}
+
+// flagSet reports whether name was given on the command line, as opposed to
+// carrying its default.
+func flagSet(fs *flag.FlagSet, name string) bool {
+	found := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == name {
+			found = true
+		}
+	})
+	return found
+}
+
+// boolDefault is the env-derived default for a boolean flag.
+func boolDefault(env getenv, key string, def bool) bool {
+	if v, ok := envBool(env, key); ok {
+		return v
+	}
+	return def
+}
+
+// checkPair rejects a half-configured certificate: one of the two files alone
+// cannot serve TLS, and treating it as "TLS off" would silently serve
+// plaintext on a listener the operator meant to protect.
+func checkPair(certFlag, cert, keyFlag, key string) error {
+	if (cert == "") != (key == "") {
+		return fmt.Errorf("%s and %s must be set together", certFlag, keyFlag)
+	}
+	return nil
 }
 
 func run(cfg config) error {
-	if cfg.pgDSN == "" || cfg.signingKeyPEM == "" || cfg.controllerAddr == "" || cfg.hubAddr == "" || cfg.workerImage == "" {
-		return fmt.Errorf("--pg-dsn, --worker-jwt-signing-key, --controller-addr, --hub-addr and --worker-image are required")
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
@@ -193,6 +391,18 @@ func run(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("kubernetes client: %w", err)
 	}
+	// An unreadable or malformed overrides file is an operator mistake, and
+	// refusing to start says so far more clearly than worker pods that come up
+	// without the configuration the operator declared.
+	var podOverrides controller.WorkerPodOverrides
+	if cfg.workerPodOverridesFile != "" {
+		if podOverrides, err = controller.LoadWorkerPodOverridesFile(cfg.workerPodOverridesFile); err != nil {
+			return err
+		}
+		log.Printf("worker pod overrides: loaded from %s (%d annotation(s), %d label(s), %d toleration(s))",
+			cfg.workerPodOverridesFile, len(podOverrides.Annotations), len(podOverrides.Labels), len(podOverrides.Tolerations))
+	}
+
 	pods, err := controller.NewKubePods(controller.KubePodsOptions{
 		Client:             clientset,
 		Namespace:          cfg.workerNamespace,
@@ -201,29 +411,46 @@ func run(cfg config) error {
 		Generation:         fmt.Sprintf("g%d", time.Now().Unix()),
 		DefaultCPULimit:    cfg.workerCPULimit,
 		DefaultMemLimit:    cfg.workerMemLimit,
+		CommonPodOverrides: podOverrides,
 	})
 	if err != nil {
 		return fmt.Errorf("kubepods: %w", err)
 	}
 
 	ctrl, err := controller.New(controller.Options{
-		Provider:            prov,
-		Queue:               inmemory.New(),
-		Scaler:              defaultscaler.New(),
-		Pods:                pods,
-		SigningKey:          priv,
-		Defaults:            cfg.defaults,
-		ControllerAddr:      cfg.controllerAddr,
-		HubAddr:             cfg.hubAddr,
-		HubLogAddr:          cfg.hubLogAddr,
-		BundleMinIdle:       cfg.bundleMinIdle,
-		BundleCacheMaxBytes: cfg.bundleCacheMax,
+		Provider:             prov,
+		Queue:                inmemory.New(),
+		Scaler:               defaultscaler.New(),
+		Pods:                 pods,
+		SigningKey:           priv,
+		Defaults:             cfg.defaults,
+		ControllerAddr:       cfg.controllerAdvertiseAddr,
+		HubAddr:              cfg.hubAdvertiseAddr,
+		HubLogAddr:           cfg.hubLogAdvertiseAddr,
+		WorkerCACertFile:     cfg.workerCACertFile,
+		ControllerTLS:        cfg.advertiseControllerTLS,
+		HubLogTLS:            cfg.advertiseHubLogTLS,
+		ControllerServerName: cfg.controllerAdvertiseSNI,
+		HubServerName:        cfg.hubAdvertiseSNI,
+		HubLogServerName:     cfg.hubLogAdvertiseSNI,
+		BundleMinIdle:        cfg.bundleMinIdle,
+		BundleCacheMaxBytes:  cfg.bundleCacheMax,
 	})
 	if err != nil {
 		return fmt.Errorf("controller: %w", err)
 	}
 
-	grpcSrv := grpc.NewServer()
+	var grpcOpts []grpc.ServerOption
+	if cfg.tlsCertFile != "" {
+		// tlsconf.ServerConfig re-reads the pair when it changes on disk, so a
+		// cert-manager renewal takes effect without restarting the controller.
+		tlsCfg, err := tlsconf.ServerConfig(cfg.tlsCertFile, cfg.tlsKeyFile)
+		if err != nil {
+			return fmt.Errorf("grpc tls: %w", err)
+		}
+		grpcOpts = append(grpcOpts, grpc.Creds(credentials.NewTLS(tlsCfg)))
+	}
+	grpcSrv := grpc.NewServer(grpcOpts...)
 	ctrl.RegisterServices(grpcSrv)
 
 	lis, err := net.Listen("tcp", cfg.listen)
@@ -233,7 +460,8 @@ func run(cfg config) error {
 	errc := make(chan error, 3)
 	go func() { errc <- grpcSrv.Serve(lis) }()
 	go func() { errc <- ctrl.Run(ctx) }()
-	log.Printf("controller listening on %s", cfg.listen)
+	log.Printf("controller listening on %s (tls=%t, advertising controller tls=%t to workers)",
+		cfg.listen, cfg.tlsCertFile != "", cfg.advertiseControllerTLS)
 
 	adminSrv, err := startAdminAPI(ctx, cfg, prov, errc)
 	if err != nil {
@@ -276,17 +504,52 @@ func startAdminAPI(ctx context.Context, cfg config, prov *postgres.Provider, err
 		Admin:          admin,
 		Storage:        store,
 		MaxUploadBytes: cfg.adminMaxUpload,
+		// Reported on every upload so `duru deploy` prints the URL this
+		// controller actually serves, rather than the client's own default.
+		PagesDomain: cfg.pagesDomain,
+		// New rejects an unusable TempDir right here, so a controller that
+		// cannot extract uploads (read-only root filesystem, no writable
+		// volume) fails to start instead of failing on the first deployment.
+		TempDir: cfg.adminTempDir,
+		// Same handler as the rest of the binary: one JSON stream on stderr.
+		Logger: slog.Default().With("component", "adminapi"),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("admin api: %w", err)
 	}
 
 	srv := &http.Server{Addr: cfg.adminListen, Handler: h}
+	if cfg.adminTLSCertFile != "" {
+		tlsCfg, err := tlsconf.ServerConfig(cfg.adminTLSCertFile, cfg.adminTLSKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("admin api tls: %w", err)
+		}
+		srv.TLSConfig = tlsCfg
+	}
 	go func() {
-		log.Printf("admin API listening on %s (UNAUTHENTICATED — keep this port private)", cfg.adminListen)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Printf("admin API listening on %s (tls=%t, UNAUTHENTICATED — keep this port private)",
+			cfg.adminListen, srv.TLSConfig != nil)
+		var err error
+		if srv.TLSConfig != nil {
+			// Empty file names: the certificate comes from TLSConfig, which
+			// reloads it on renewal instead of pinning what was on disk at
+			// startup.
+			err = srv.ListenAndServeTLS("", "")
+		} else {
+			err = srv.ListenAndServe()
+		}
+		if err != nil && err != http.ErrServerClosed {
 			errc <- err
 		}
 	}()
 	return srv, nil
+}
+
+// fatalf reports a startup failure and exits. It exists because log.Fatalf
+// routes through the slog bridge installed by setupLogging and lands at INFO,
+// filing the failure that kills the process under the same level as routine
+// progress -- exactly where an operator scanning for errors will not look.
+func fatalf(format string, args ...any) {
+	slog.Error(fmt.Sprintf(format, args...))
+	os.Exit(1)
 }

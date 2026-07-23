@@ -30,6 +30,230 @@ func newKubePodsForTest(t *testing.T) (*kubePods, *fake.Clientset) {
 	return kp, cs
 }
 
+// newKubePodsWithOverrides is newKubePodsForTest plus cluster-wide
+// WorkerPodOverrides.
+func newKubePodsWithOverrides(t *testing.T, ov WorkerPodOverrides) (*kubePods, *fake.Clientset) {
+	t.Helper()
+	cs := fake.NewSimpleClientset()
+	kp, err := NewKubePods(KubePodsOptions{
+		Client:             cs,
+		Namespace:          "durupages-workers",
+		Image:              "durupages/worker:latest",
+		Generation:         "gen-abc123",
+		CommonPodOverrides: ov,
+	})
+	if err != nil {
+		t.Fatalf("NewKubePods: %v", err)
+	}
+	return kp, cs
+}
+
+// newKubePodsWithCommonAnnotations is newKubePodsWithOverrides for the
+// annotations-only case, which most of the older tests below exercise.
+func newKubePodsWithCommonAnnotations(t *testing.T, common map[string]string) (*kubePods, *fake.Clientset) {
+	t.Helper()
+	return newKubePodsWithOverrides(t, WorkerPodOverrides{Annotations: common})
+}
+
+// createdPod creates spec and returns the resulting pod.
+func createdPod(t *testing.T, kp *kubePods, cs *fake.Clientset, spec PodSpec) *corev1.Pod {
+	t.Helper()
+	if err := kp.Create(context.Background(), spec); err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	pod, err := cs.CoreV1().Pods("durupages-workers").Get(context.Background(), spec.Name, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	return pod
+}
+
+// TestKubePodsCommonAnnotationsOnly checks operator annotations reach a pod
+// whose tenant declared none.
+func TestKubePodsCommonAnnotationsOnly(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, map[string]string{
+		"prometheus.io/scrape": "true",
+		"prometheus.io/port":   "9090",
+	})
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+	if pod.Annotations["prometheus.io/scrape"] != "true" || pod.Annotations["prometheus.io/port"] != "9090" {
+		t.Fatalf("common annotations missing: %v", pod.Annotations)
+	}
+}
+
+// TestKubePodsTenantAnnotationsWithoutCommon checks the feature stays out of
+// the way when no common set is configured.
+func TestKubePodsTenantAnnotationsWithoutCommon(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, nil)
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Annotations: map[string]string{"example.com/note": "hi"},
+	})
+	if len(pod.Annotations) != 1 || pod.Annotations["example.com/note"] != "hi" {
+		t.Fatalf("tenant annotations wrong: %v", pod.Annotations)
+	}
+}
+
+// TestKubePodsCommonAnnotationsWinOverTenant pins the precedence: the operator's
+// cluster-wide policy is not something a tenant can opt out of by naming the
+// same key, while keys the operator has not claimed still belong to the tenant.
+func TestKubePodsCommonAnnotationsWinOverTenant(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, map[string]string{
+		"prometheus.io/scrape":    "true",
+		"sidecar.istio.io/inject": "false",
+	})
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Annotations: map[string]string{
+			"prometheus.io/scrape": "false", // tenant tries to opt out
+			"example.com/note":     "hi",    // tenant's own key, untouched
+		},
+	})
+	if pod.Annotations["prometheus.io/scrape"] != "true" {
+		t.Fatalf("tenant overrode a common annotation: %v", pod.Annotations)
+	}
+	if pod.Annotations["sidecar.istio.io/inject"] != "false" {
+		t.Fatalf("common annotation missing: %v", pod.Annotations)
+	}
+	if pod.Annotations["example.com/note"] != "hi" {
+		t.Fatalf("tenant annotation lost: %v", pod.Annotations)
+	}
+}
+
+// TestKubePodsCommonAnnotationsLeaveSystemLabelsAlone checks the labels that
+// reconcile relies on are unaffected by the annotation merge.
+func TestKubePodsCommonAnnotationsLeaveSystemLabelsAlone(t *testing.T) {
+	kp, cs := newKubePodsWithCommonAnnotations(t, map[string]string{"prometheus.io/scrape": "true"})
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Labels: map[string]string{"team": "web"},
+	})
+	if pod.Labels[labelAppName] != appNameWorker || pod.Labels[labelTenantID] != "acme" ||
+		pod.Labels[labelGeneration] != "gen-abc123" {
+		t.Fatalf("system labels disturbed: %v", pod.Labels)
+	}
+	if pod.Labels["team"] != "web" {
+		t.Fatalf("tenant label lost: %v", pod.Labels)
+	}
+	if _, ok := pod.Labels["prometheus.io/scrape"]; ok {
+		t.Fatalf("annotation leaked into labels: %v", pod.Labels)
+	}
+}
+
+// TestKubePodsCommonLabelsWinOverTenant mirrors the annotation precedence test
+// for labels: the operator's cluster-wide set wins on collision, and the
+// system labels reconcile relies on remain untouched by either.
+func TestKubePodsCommonLabelsWinOverTenant(t *testing.T) {
+	kp, cs := newKubePodsWithOverrides(t, WorkerPodOverrides{
+		Labels: map[string]string{"team": "platform", "cost-center": "infra"},
+	})
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Labels: map[string]string{"team": "acme-web", "app": "blog"},
+	})
+	if pod.Labels["team"] != "platform" {
+		t.Fatalf("tenant overrode a common label: %v", pod.Labels)
+	}
+	if pod.Labels["cost-center"] != "infra" || pod.Labels["app"] != "blog" {
+		t.Fatalf("labels merged wrong: %v", pod.Labels)
+	}
+	if pod.Labels[labelAppName] != appNameWorker || pod.Labels[labelTenantID] != "acme" {
+		t.Fatalf("system labels disturbed: %v", pod.Labels)
+	}
+}
+
+// TestKubePodsCommonPodOverridesApplyScheduling checks that the
+// scheduling/placement fields -- which have no tenant-level equivalent to
+// merge with -- land on the pod spec verbatim.
+func TestKubePodsCommonPodOverridesApplyScheduling(t *testing.T) {
+	rc := "gvisor"
+	ov := WorkerPodOverrides{
+		NodeSelector: map[string]string{"workload": "durupages-worker"},
+		Tolerations: []corev1.Toleration{{
+			Key: "durupages.io/dedicated", Operator: corev1.TolerationOpEqual,
+			Value: "true", Effect: corev1.TaintEffectNoSchedule,
+		}},
+		Affinity: &corev1.Affinity{
+			NodeAffinity: &corev1.NodeAffinity{
+				RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+					NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+						MatchExpressions: []corev1.NodeSelectorRequirement{{
+							Key: "kubernetes.io/arch", Operator: corev1.NodeSelectorOpIn, Values: []string{"amd64"},
+						}},
+					}},
+				},
+			},
+		},
+		DNSPolicy:         corev1.DNSNone,
+		DNSConfig:         &corev1.PodDNSConfig{Nameservers: []string{"10.0.0.10"}},
+		PriorityClassName: "high-priority",
+		RuntimeClassName:  &rc,
+	}
+	kp, cs := newKubePodsWithOverrides(t, ov)
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+
+	if pod.Spec.NodeSelector["workload"] != "durupages-worker" {
+		t.Fatalf("nodeSelector missing: %v", pod.Spec.NodeSelector)
+	}
+	if len(pod.Spec.Tolerations) != 1 || pod.Spec.Tolerations[0].Key != "durupages.io/dedicated" {
+		t.Fatalf("tolerations missing: %v", pod.Spec.Tolerations)
+	}
+	if pod.Spec.Affinity == nil || pod.Spec.Affinity.NodeAffinity == nil {
+		t.Fatalf("affinity missing: %v", pod.Spec.Affinity)
+	}
+	if pod.Spec.DNSPolicy != corev1.DNSNone || pod.Spec.DNSConfig == nil ||
+		len(pod.Spec.DNSConfig.Nameservers) != 1 || pod.Spec.DNSConfig.Nameservers[0] != "10.0.0.10" {
+		t.Fatalf("dns config wrong: policy=%v config=%v", pod.Spec.DNSPolicy, pod.Spec.DNSConfig)
+	}
+	if pod.Spec.PriorityClassName != "high-priority" {
+		t.Fatalf("priorityClassName missing: %v", pod.Spec.PriorityClassName)
+	}
+	if pod.Spec.RuntimeClassName == nil || *pod.Spec.RuntimeClassName != "gvisor" {
+		t.Fatalf("runtimeClassName missing: %v", pod.Spec.RuntimeClassName)
+	}
+}
+
+// TestKubePodsCommonPodOverridesLeaveCoreSpecAlone guards the allowlist: no
+// combination of overrides may reach the container, volumes, security
+// context, service account or restart policy the controller itself sets --
+// those are what keeps every worker pod fungible and isolated.
+func TestKubePodsCommonPodOverridesLeaveCoreSpecAlone(t *testing.T) {
+	kp, cs := newKubePodsWithOverrides(t, WorkerPodOverrides{
+		NodeSelector: map[string]string{"workload": "durupages-worker"},
+	})
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("RestartPolicy = %v", pod.Spec.RestartPolicy)
+	}
+	if len(pod.Spec.Containers) != 1 || pod.Spec.Containers[0].Name != workerContainerName {
+		t.Fatalf("containers disturbed: %v", pod.Spec.Containers)
+	}
+	if pod.Spec.SecurityContext == nil || !*pod.Spec.SecurityContext.RunAsNonRoot {
+		t.Fatalf("pod security context disturbed: %v", pod.Spec.SecurityContext)
+	}
+}
+
+// TestNewKubePodsRejectsBadCommonAnnotations checks the validation also guards
+// callers that build the map themselves rather than reading the file.
+func TestNewKubePodsRejectsBadCommonAnnotations(t *testing.T) {
+	for _, common := range []map[string]string{
+		{"bad key!": "x"},
+		{labelTenantID: "evil"},
+		{"app.kubernetes.io/name": "spoof"},
+	} {
+		_, err := NewKubePods(KubePodsOptions{
+			Client:             fake.NewSimpleClientset(),
+			Namespace:          "durupages-workers",
+			Image:              "durupages/worker:latest",
+			CommonPodOverrides: WorkerPodOverrides{Annotations: common},
+		})
+		if err == nil {
+			t.Fatalf("NewKubePods accepted %v", common)
+		}
+	}
+}
+
 func TestKubePodsCreateBuildsHardenedPod(t *testing.T) {
 	kp, cs := newKubePodsForTest(t)
 	ctx := context.Background()
@@ -157,6 +381,83 @@ func TestKubePodsRejectsSystemLabelConflict(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected rejection of app.kubernetes.io/* label")
+	}
+}
+
+// A tenant must not be able to relax its own worker container's security
+// profile through the AppArmor/seccomp annotations still honoured by many
+// clusters -- the securityContext fields themselves are unreachable, but the
+// annotation-shaped hole beside them has to be closed too.
+func TestKubePodsRejectsTenantSecurityAnnotations(t *testing.T) {
+	kp, _ := newKubePodsForTest(t)
+	ctx := context.Background()
+
+	for _, key := range []string{
+		"container.apparmor.security.beta.kubernetes.io/" + workerContainerName,
+		"Container.AppArmor.Security.Beta.Kubernetes.io/x", // case-insensitive
+		"seccomp.security.alpha.kubernetes.io/pod",
+		"container.seccomp.security.alpha.kubernetes.io/" + workerContainerName,
+	} {
+		err := kp.Create(ctx, PodSpec{
+			Name: "p", TenantID: "acme",
+			Annotations: map[string]string{key: "unconfined"},
+		})
+		if err == nil {
+			t.Fatalf("accepted security annotation %q", key)
+		}
+	}
+}
+
+// The operator's cluster-wide overrides are trusted: a security annotation
+// there is the platform's own call and is not filtered.
+func TestKubePodsAllowsOperatorSecurityAnnotations(t *testing.T) {
+	kp, cs := newKubePodsWithOverrides(t, WorkerPodOverrides{
+		Annotations: map[string]string{
+			"container.apparmor.security.beta.kubernetes.io/" + workerContainerName: "runtime/default",
+		},
+	})
+	pod := createdPod(t, kp, cs, PodSpec{Name: "p", TenantID: "acme"})
+	if pod.Annotations["container.apparmor.security.beta.kubernetes.io/"+workerContainerName] != "runtime/default" {
+		t.Fatalf("operator security annotation lost: %v", pod.Annotations)
+	}
+}
+
+// The single most important invariant: no tenant-supplied label or annotation
+// can reach the injected secret env, the security context, the service account
+// or the restart policy. They structurally cannot (those are struct fields the
+// controller sets and the merges only touch metadata), but it is worth pinning.
+func TestKubePodsTenantMetadataCannotReachCoreSpec(t *testing.T) {
+	kp, cs := newKubePodsForTest(t)
+	pod := createdPod(t, kp, cs, PodSpec{
+		Name: "p", TenantID: "acme",
+		Labels:      map[string]string{"team": "web"},
+		Annotations: map[string]string{"example.com/note": "hi"},
+		Env: map[string]string{
+			"DURUPAGES_WORKER_JWT":  "signed-jwt",
+			"DURUPAGES_CA_CERT_PEM": "ca-pem",
+		},
+	})
+
+	if pod.Spec.ServiceAccountName != "durupages-worker-noperm" {
+		t.Fatalf("service account changed: %q", pod.Spec.ServiceAccountName)
+	}
+	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
+		t.Fatalf("restart policy changed: %q", pod.Spec.RestartPolicy)
+	}
+	sc := pod.Spec.Containers[0].SecurityContext
+	if sc == nil || !*sc.ReadOnlyRootFilesystem || !*sc.RunAsNonRoot {
+		t.Fatalf("container security context weakened: %+v", sc)
+	}
+	// The injected secret env is a container field, never surfaced as metadata.
+	if _, ok := pod.Annotations["DURUPAGES_WORKER_JWT"]; ok {
+		t.Fatal("injected env leaked into annotations")
+	}
+	env := map[string]string{}
+	for _, e := range pod.Spec.Containers[0].Env {
+		env[e.Name] = e.Value
+	}
+	if env["DURUPAGES_WORKER_JWT"] != "signed-jwt" || env["DURUPAGES_CA_CERT_PEM"] != "ca-pem" {
+		t.Fatalf("injected env not carried on the container: %v", env)
 	}
 }
 

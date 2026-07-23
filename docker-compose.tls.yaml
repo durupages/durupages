@@ -1,0 +1,59 @@
+# Copyright 2026 JC-Lab
+# SPDX-License-Identifier: EPL-2.0
+
+# TLS overlay for the e2e stack. Used as
+#   docker compose -f docker-compose.yaml -f docker-compose.tls.yaml ...
+# which is what e2e/env.sh does when E2E_TLS=1.
+#
+# It encrypts every hop between components:
+#   worker shim  -> controller   gRPC
+#   router       -> controller   gRPC
+#   worker shim  -> hub          bundle HTTP
+#   worker shim  -> hub          log ingest gRPC
+#   router       -> hub          log ingest gRPC
+#
+# The router's own public listener stays plaintext: it is the client-facing
+# edge, terminated by an ingress in a real deployment, and the e2e scenarios
+# drive it over http.
+#
+# Everything is expressed as environment rather than command flags on purpose.
+# Compose merges `environment` across overlay files but *replaces* `command`, so
+# using flags here would mean restating each service's whole command line and
+# letting the two copies drift.
+
+services:
+  hub:
+    environment:
+      # Both hub listeners (bundle HTTP, log ingest gRPC) share one certificate
+      # here. The separate --log-tls-* pair exists for split domains; a single
+      # host covers both in this stack.
+      - DURUPAGES_TLS_CERT_FILE=/certs/hub.crt
+      - DURUPAGES_TLS_KEY_FILE=/certs/hub.key
+    volumes:
+      - ./e2e/.certs:/certs:ro
+
+  controller:
+    environment:
+      - DURUPAGES_TLS_CERT_FILE=/certs/controller.crt
+      - DURUPAGES_TLS_KEY_FILE=/certs/controller.key
+      # Read per pod creation and injected as DURUPAGES_CA_CERT_PEM, which is
+      # how a worker pod in another namespace comes to trust the control plane.
+      - DURUPAGES_WORKER_CA_CERT_FILE=/certs/ca.crt
+      # Advertised to workers: what the endpoints they dial actually serve.
+      - DURUPAGES_CONTROLLER_TLS=true
+      - DURUPAGES_HUB_LOG_TLS=true
+      # https, so the shim treats bundle downloads as TLS.
+      - DURUPAGES_HUB_ADVERTISE_ADDR=https://172.28.0.11:9080
+      - DURUPAGES_HUB_LOG_ADVERTISE_ADDR=172.28.0.11:9443
+    volumes:
+      - ./e2e/.certs:/certs:ro
+
+  router:
+    environment:
+      # The router is a client only: it verifies, it never serves TLS.
+      - DURUPAGES_CA_CERT_FILE=/certs/ca.crt
+      - DURUPAGES_CONTROLLER_TLS=true
+      - DURUPAGES_HUB_LOG_ADDR=172.28.0.11:9443
+      - DURUPAGES_HUB_LOG_TLS=true
+    volumes:
+      - ./e2e/.certs:/certs:ro

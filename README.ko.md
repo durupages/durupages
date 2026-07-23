@@ -51,6 +51,7 @@ Client ──▶ durupages-router ──▶ durupages-controller ──▶ (k8s)
 
 ```sh
 make e2e        # 이미지 빌드 → 스택 기동 → 시나리오 검증 → 정리
+make e2e-tls    # 동일 시나리오를 컴포넌트 간 TLS 상태로 실행
 ```
 
 스택만 띄우고 직접 배포해 보려면:
@@ -155,7 +156,7 @@ helm install durupages deploy/chart/durupages \
   --set-file workerJwt.publicKeyPEM=worker-jwt.pub \
   --set postgres.dsn='postgres://...' \
   --set s3.bucket=durupages \
-  --set router.pagesDomain=pages.example.com
+  --set pagesDomain=pages.example.com
 ```
 
 Chart 는 controller/router/hub 와 worker 네임스페이스·ServiceAccount·RBAC·NetworkPolicy 를 설치합니다. worker Pod 는 controller 가 런타임에 직접 생성합니다. 자세한 값은 [deploy/chart/durupages/README.md](deploy/chart/durupages/README.md) 를 참고하세요.
@@ -196,6 +197,7 @@ ctrl, err := controller.New(controller.Options{
 go build ./...
 go test -race ./...      # 또는 make test
 make e2e                 # 통합 e2e (Docker 필요)
+make e2e-tls             # 동일 e2e 를 컴포넌트 간 TLS 로 실행
 ```
 
 각 바이너리는 `--version` 으로 빌드 시 새겨진 버전을 출력합니다. 릴리스 빌드는 Go 크로스컴파일로 `linux/amd64`·`linux/arm64` 바이너리를 만들고, 이미지는 그 산출물을 패키징만 합니다.

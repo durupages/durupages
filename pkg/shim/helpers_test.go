@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -89,6 +90,14 @@ func (f *fakeRuntime) Launch(ctx context.Context, spec runtime.InstanceSpec) (ru
 	f.instances = append(f.instances, inst)
 	f.mu.Unlock()
 	return inst, nil
+}
+
+// setLaunchErr makes every subsequent Launch fail, simulating a workerd that
+// refuses to start.
+func (f *fakeRuntime) setLaunchErr(err error) {
+	f.mu.Lock()
+	f.launchErr = err
+	f.mu.Unlock()
 }
 
 func (f *fakeRuntime) instanceAt(i int) *fakeInstance {
@@ -356,6 +365,9 @@ type harness struct {
 	pub    ed25519.PublicKey
 	clock  *fakeClock
 	logBuf *syncBuffer
+	// opsBuf collects Options.Logger output (the shim's own operational log),
+	// which is a different stream from logBuf (the tenant-facing pod log).
+	opsBuf *syncBuffer
 	ctx    context.Context
 	cancel context.CancelFunc
 	done   chan error
@@ -380,9 +392,17 @@ func (b *syncBuffer) String() string {
 
 // hubMux serves the bundles registered by tests.
 type hubMux struct {
-	mu      sync.Mutex
-	bundles map[string][]byte // "tenant/page/dep" -> tar
-	auth    []string
+	mu        sync.Mutex
+	bundles   map[string][]byte // "tenant/page/dep" -> tar
+	auth      []string
+	requestID []string // X-DuruPages-Request-Id seen on each fetch
+}
+
+// requestIDs returns the correlation ids the hub side observed.
+func (h *hubMux) requestIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.requestID...)
 }
 
 func (h *hubMux) set(tenant, page, dep string, tar []byte) {
@@ -405,6 +425,7 @@ func (h *hubMux) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	tarBytes, ok := h.bundles[key]
 	h.auth = append(h.auth, r.Header.Get("Authorization"))
+	h.requestID = append(h.requestID, r.Header.Get(api.HeaderRequestID))
 	h.mu.Unlock()
 	if !ok {
 		http.NotFound(w, r)
@@ -440,6 +461,7 @@ func newHarness(t *testing.T, ho harnessOpts) (*harness, *hubMux) {
 	worker := &fakeWorkerService{sendDrain: ho.sendDrain}
 	wc := newWorkerClient(t, worker)
 	logBuf := &syncBuffer{}
+	opsBuf := &syncBuffer{}
 
 	tenant := ho.tenantID
 	if tenant == "" {
@@ -459,6 +481,7 @@ func newHarness(t *testing.T, ho harnessOpts) (*harness, *hubMux) {
 		SweepInterval: ho.sweep,
 		LogClient:     ho.logClient,
 		LogWriter:     logBuf,
+		Logger:        slog.New(slog.NewJSONHandler(opsBuf, &slog.HandlerOptions{Level: slog.LevelDebug})),
 		Now:           clock.now,
 		ProxyAddr:     "127.0.0.1:0",
 		AssetsAddr:    "127.0.0.1:0",
@@ -483,7 +506,7 @@ func newHarness(t *testing.T, ho harnessOpts) (*harness, *hubMux) {
 	ctx, cancel := context.WithCancel(context.Background())
 	h := &harness{
 		t: t, shim: sh, rt: rt, hub: hub, worker: worker,
-		priv: priv, pub: pub, clock: clock, logBuf: logBuf,
+		priv: priv, pub: pub, clock: clock, logBuf: logBuf, opsBuf: opsBuf,
 		ctx: ctx, cancel: cancel, done: make(chan error, 1),
 	}
 	if !ho.noStartRun {
@@ -555,6 +578,32 @@ func (h *harness) usageLines() []usageLine {
 		}
 	}
 	return out
+}
+
+// opsLines returns the shim's operational log lines (Options.Logger) parsed as
+// JSON objects, in emission order.
+func (h *harness) opsLines() []map[string]any {
+	var out []map[string]any
+	for _, line := range strings.Split(strings.TrimRight(h.opsBuf.String(), "\n"), "\n") {
+		if line == "" {
+			continue
+		}
+		var m map[string]any
+		if json.Unmarshal([]byte(line), &m) == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+// opsLine returns the first operational log line whose "msg" equals msg, or nil.
+func (h *harness) opsLine(msg string) map[string]any {
+	for _, l := range h.opsLines() {
+		if l["msg"] == msg {
+			return l
+		}
+	}
+	return nil
 }
 
 // ed25519GenerateKey returns a fresh key pair.

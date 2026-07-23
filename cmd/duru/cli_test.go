@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -32,23 +34,37 @@ type testAPI struct {
 	headers []http.Header
 }
 
-// newTestAPI starts an admin API server for one test.
+// newTestAPI starts an admin API server for one test, serving the default
+// pages domain.
 func newTestAPI(t *testing.T) *testAPI {
+	t.Helper()
+	return newTestAPIWithDomain(t, "pages.local")
+}
+
+// newTestAPIWithDomain starts an admin API server that serves pagesDomain, so a
+// test can tell the controller's domain apart from the CLI's own default.
+func newTestAPIWithDomain(t *testing.T, pagesDomain string) *testAPI {
 	t.Helper()
 	// Keep the ambient environment out of the flag defaults.
 	t.Setenv("DURUPAGES_ADMIN_URL", "")
 	t.Setenv("DURUPAGES_ADMIN_TOKEN", "")
 	t.Setenv("DURUPAGES_TENANT", "")
 	t.Setenv("DURUPAGES_PAGE", "")
+	t.Setenv("DURUPAGES_PAGES_DOMAIN", "")
 
 	api := &testAPI{
-		provider: memprovider.New(memprovider.Options{PagesDomain: "pages.local"}),
+		provider: memprovider.New(memprovider.Options{PagesDomain: pagesDomain}),
 		storage:  memstorage.New(),
 	}
 	h, err := adminapi.New(adminapi.Options{
-		Provider:   api.provider,
-		Admin:      api.provider,
-		Storage:    api.storage,
+		Provider:    api.provider,
+		Admin:       api.provider,
+		Storage:     api.storage,
+		PagesDomain: pagesDomain,
+		// The admin API logs every request to slog.Default() unless told
+		// otherwise; these tests assert on the CLI's output, so keep the
+		// server's request log out of the test output.
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Middleware: []func(http.Handler) http.Handler{api.recordHeaders},
 	})
 	if err != nil {
@@ -666,6 +682,43 @@ func TestDeploymentUploadAndActivate(t *testing.T) {
 	// Activating an unknown deployment is a 404.
 	if res := api.run(t, "--page", "blog", "deployment", "activate", "nope"); res.code != 1 {
 		t.Fatalf("exit %d: %s", res.code, res.stderr)
+	}
+}
+
+// A controller serving a domain other than the CLI's built-in default must
+// still have its own domain reported. Before the admin API returned
+// pagesDomain, changing the controller's domain (for example through the Helm
+// chart) left `duru deploy` printing "pages.local" regardless.
+func TestDeployReportsControllerPagesDomain(t *testing.T) {
+	api := newTestAPIWithDomain(t, "pages.example.com")
+	dir := writeBuildOutput(t)
+
+	res := runCLI(t, "", "deploy", "--dir", dir, "--tenant", "acme", "--page", "blog",
+		"--admin-url", api.URL, "--deployment", "dep-one")
+	if res.code != 0 {
+		t.Fatalf("exit %d: %s", res.code, res.stderr)
+	}
+	if want := "url: https://blog.pages.example.com/\n"; !strings.Contains(res.stdout, want) {
+		t.Fatalf("stdout = %q, want it to contain %q", res.stdout, want)
+	}
+	if strings.Contains(res.stdout, "pages.local") {
+		t.Fatalf("stdout still reports the CLI default: %q", res.stdout)
+	}
+}
+
+// An explicitly chosen --pages-domain is the operator's call and outranks what
+// the controller reports.
+func TestDeployExplicitPagesDomainWins(t *testing.T) {
+	api := newTestAPIWithDomain(t, "pages.example.com")
+	dir := writeBuildOutput(t)
+
+	res := runCLI(t, "", "deploy", "--dir", dir, "--tenant", "acme", "--page", "blog",
+		"--admin-url", api.URL, "--deployment", "dep-one", "--pages-domain", "vanity.test")
+	if res.code != 0 {
+		t.Fatalf("exit %d: %s", res.code, res.stderr)
+	}
+	if want := "url: https://blog.vanity.test/\n"; !strings.Contains(res.stdout, want) {
+		t.Fatalf("stdout = %q, want it to contain %q", res.stdout, want)
 	}
 }
 

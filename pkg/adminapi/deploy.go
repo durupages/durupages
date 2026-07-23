@@ -55,11 +55,15 @@ func writeAPIError(w http.ResponseWriter, err error) {
 
 // deployResponse is the 201 body of a deployment upload.
 type deployResponse struct {
-	DeploymentID string          `json:"deploymentId"`
-	PageID       string          `json:"pageId"`
-	TenantID     string          `json:"tenantId"`
-	Activated    bool            `json:"activated"`
-	Manifest     manifestSummary `json:"manifest"`
+	DeploymentID string `json:"deploymentId"`
+	PageID       string `json:"pageId"`
+	TenantID     string `json:"tenantId"`
+	Activated    bool   `json:"activated"`
+	// PagesDomain is the domain this controller actually serves pages on, so a
+	// client can report the deployed URL instead of guessing it from its own
+	// configuration. Omitted when the controller was not told one.
+	PagesDomain string          `json:"pagesDomain,omitempty"`
+	Manifest    manifestSummary `json:"manifest"`
 }
 
 // manifestSummary is the deployment manifest reduced to what a deploying
@@ -167,6 +171,7 @@ func (s *Server) handleCreateDeployment(w http.ResponseWriter, r *http.Request) 
 		PageID:       pageID,
 		TenantID:     page.TenantID,
 		Activated:    activate,
+		PagesDomain:  s.pagesDomain,
 		Manifest:     summarize(scanned.Manifest),
 	})
 }
@@ -191,8 +196,12 @@ func summarize(m *manifest.Manifest) manifestSummary {
 // extractUpload streams the request body into a fresh temporary directory and
 // returns the build output root inside it. The caller must always invoke
 // cleanup, which is non-nil as soon as the directory exists.
+//
+// The directory is created under Options.TempDir (os.TempDir() when unset);
+// a deployment with a read-only root filesystem points that option at a
+// writable volume.
 func (s *Server) extractUpload(w http.ResponseWriter, r *http.Request) (root string, cleanup func(), err error) {
-	tmp, err := os.MkdirTemp("", "durupages-upload-")
+	tmp, err := os.MkdirTemp(s.tempDir, "durupages-upload-")
 	if err != nil {
 		return "", nil, fmt.Errorf("create temp dir: %w", err)
 	}

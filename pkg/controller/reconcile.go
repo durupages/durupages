@@ -3,7 +3,10 @@
 
 package controller
 
-import "context"
+import (
+	"context"
+	"log/slog"
+)
 
 // reconcile is run once at startup (ARCHITECTURE 6.5). It lists live worker
 // pods and seeds each into its tenant's pool as a pending "creating" pod with
@@ -22,6 +25,18 @@ func (c *Controller) reconcile(ctx context.Context) {
 	for _, ep := range existing {
 		if ep.TenantID == "" {
 			// No tenant label: cannot own it safely — delete as an orphan.
+			_ = c.opts.Pods.Delete(ctx, ep.Name)
+			continue
+		}
+		if ep.Failed {
+			// Already dead (RestartPolicyNever, non-zero exit) and never
+			// registered, or it would already be tracked from a prior run.
+			// Adopting it would only earn it an adoption window it can never use
+			// while it sits there counting against the tenant's pod ceiling
+			// (readyCreatingCountLocked) -- excluding it here beats discovering
+			// that after the window expires.
+			slog.Warn("controller: reconcile excluding failed worker pod",
+				"tenant", ep.TenantID, "pod", ep.Name)
 			_ = c.opts.Pods.Delete(ctx, ep.Name)
 			continue
 		}
@@ -53,8 +68,12 @@ func (c *Controller) scaleDownOnce(ctx context.Context) {
 	listed, err := c.opts.Pods.List(ctx)
 	listOK := err == nil
 	listedNames := make(map[string]struct{}, len(listed))
+	failedNames := make(map[string]struct{})
 	for _, ep := range listed {
 		listedNames[ep.Name] = struct{}{}
+		if ep.Failed {
+			failedNames[ep.Name] = struct{}{}
+		}
 	}
 
 	knownNames := make(map[string]struct{})
@@ -67,13 +86,31 @@ func (c *Controller) scaleDownOnce(ctx context.Context) {
 		var toDelete []string
 		for _, p := range t.pods {
 			knownNames[p.name] = struct{}{}
+			if _, failed := failedNames[p.name]; failed {
+				// RestartPolicyNever makes this terminal: the pod will never
+				// register (or, having already registered, never serve again).
+				// Deleting it now -- rather than waiting for phaseCreating's
+				// adoption window, which only ever applied to seeded pods
+				// anyway -- frees the slot it was occupying in
+				// readyCreatingCountLocked so the next maybeScaleUp actually
+				// replaces it instead of believing capacity is already met.
+				toDelete = append(toDelete, p.name)
+				continue
+			}
 			switch p.phase {
 			case phaseDraining:
 				if p.inFlight == 0 || c.now().After(p.drainDeadline) {
 					toDelete = append(toDelete, p.name)
 				}
 			case phaseCreating:
-				if p.seeded && c.now().After(p.adoptDeadline) {
+				// Any creating pod past its registration deadline, seeded or
+				// not. A fresh pod that never becomes Ready (unschedulable, or
+				// stuck pulling) stays Pending -- never PodFailed -- so the
+				// failedNames path above cannot catch it; this does. The
+				// IsZero guard is essential: without it a pod that somehow
+				// carried no deadline would be After(zero)==true and deleted on
+				// the spot.
+				if !p.adoptDeadline.IsZero() && c.now().After(p.adoptDeadline) {
 					toDelete = append(toDelete, p.name)
 				}
 			}

@@ -10,10 +10,24 @@ REPO_ROOT="$(cd "${E2E_DIR}/.." && pwd)"
 
 COMPOSE="${COMPOSE:-docker-compose}"
 COMPOSE_FILE="${REPO_ROOT}/docker-compose.yaml"
-DC() { ${COMPOSE} -f "${COMPOSE_FILE}" "$@"; }
+
+# E2E_TLS=1 runs the whole stack with TLS between the components: the overlay
+# adds the certificates and flips the addresses the controller advertises. The
+# plaintext run stays the default, so both configurations get exercised.
+E2E_TLS="${E2E_TLS:-0}"
+TLS_COMPOSE_FILE="${REPO_ROOT}/docker-compose.tls.yaml"
+if [[ "${E2E_TLS}" == "1" ]]; then
+  DC() { ${COMPOSE} -f "${COMPOSE_FILE}" -f "${TLS_COMPOSE_FILE}" "$@"; }
+else
+  DC() { ${COMPOSE} -f "${COMPOSE_FILE}" "$@"; }
+fi
 
 K3S_CTR="durupages-k3s"
 K3S_NODE_IP="172.28.0.5"
+# Fixed compose addresses. The certificates carry these as IP SANs, because
+# worker pods inside k3s cannot resolve compose service names.
+CONTROLLER_IP="172.28.0.10"
+HUB_IP="172.28.0.11"
 WORKER_NS="durupages-workers"
 WORKER_IMAGE="durupages/worker:e2e"
 
@@ -31,6 +45,7 @@ S3_SECRET_KEY="minioadmin"
 KEYS_DIR="${REPO_ROOT}/e2e/.keys"
 KUBE_DIR="${REPO_ROOT}/e2e/.kube"
 BUILD_DIR="${REPO_ROOT}/e2e/.build"
+CERTS_DIR="${REPO_ROOT}/e2e/.certs"
 
 # kubectl / ctr against the k3s node (avoids needing tooling on the host). This
 # k3s image dispatches purely on argv[0] symlinks (kubectl, ctr, crictl -> k3s)

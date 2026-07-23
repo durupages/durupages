@@ -1046,7 +1046,7 @@ type LogSink interface {
   worker 용 ServiceAccount(`durupages-worker-noperm`), NetworkPolicy(8장), worker JWT 키 Secret
   (미지정 시 chart 가 Ed25519 키쌍 생성), RBAC(controller 의 pod 관리 권한 — worker namespace 로 한정).
 - 아래 설정 표의 flag 들은 `values.yaml` 로 노출됩니다 (예: `controller.defaultQueueTimeout`,
-  `hub.bundleCacheMaxBytes`, `router.pagesDomain`). PostgreSQL/S3 같은 외부 의존성은 chart 에
+  `hub.bundleCacheMaxBytes`, `pagesDomain`). PostgreSQL/S3 같은 외부 의존성은 chart 에
   포함하지 않고 접속 정보만 values 로 받습니다 (개발용 서브차트는 `--set dev.postgres.enabled=true`
   방식의 선택 사항).
 - **worker pod 는 chart 가 만들지 않습니다** — controller 가 런타임에 동적 생성하며, chart 는
@@ -1067,8 +1067,8 @@ type LogSink interface {
 | tenant 기본 idle TTL | `--default-idle-ttl` | 60s |
 | worker 이미지 (shim + durupages-workerd) | `--worker-image` | 릴리즈 이미지 |
 | worker namespace | `--worker-namespace` | `durupages-workers` |
-| hub 주소 (shim 에 전파) | `--hub-addr` | - |
-| hub 로그 주소 (설정 시 로깅 활성화, worker 로 전파) | `--hub-log-addr` | - (미설정 = pod log 모드) |
+| hub 주소 (shim 에 전파; 스킴 필수) | `--hub-advertise-addr` | - |
+| hub 로그 주소 (설정 시 로깅 활성화, worker 로 전파) | `--hub-log-advertise-addr` | - (미설정 = pod log 모드) |
 | worker JWT 서명 개인키 (Ed25519) | `--worker-jwt-signing-key` (hub 는 대응 공개키로 검증) | - |
 | admin API 활성화 (별도 포트, 14장) | `--admin-enabled` / `DURUPAGES_ADMIN_ENABLED` | false |
 | admin API listen 주소 | `--admin-listen` / `DURUPAGES_ADMIN_LISTEN` | `:9450` |

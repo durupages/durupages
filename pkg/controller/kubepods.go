@@ -49,6 +49,13 @@ type KubePodsOptions struct {
 	// DefaultCPULimit / DefaultMemLimit apply when a PodSpec omits its own.
 	DefaultCPULimit string
 	DefaultMemLimit string
+	// CommonPodOverrides is cluster-wide worker pod configuration -- node
+	// selector, tolerations, affinity, DNS, priority, plus metadata -- applied
+	// to every worker pod regardless of tenant (see LoadWorkerPodOverridesFile).
+	// The zero value disables the feature. Its metadata fields are validated by
+	// NewKubePods, since a bad key here would fail every pod creation instead
+	// of one.
+	CommonPodOverrides WorkerPodOverrides
 }
 
 // kubePods is the Kubernetes PodManager: it creates bare pods (no
@@ -70,12 +77,25 @@ func NewKubePods(opts KubePodsOptions) (*kubePods, error) {
 	if opts.Image == "" {
 		return nil, errors.New("controller: KubePods Image is required")
 	}
+	if err := validateWorkerPodOverrides(opts.CommonPodOverrides); err != nil {
+		return nil, err
+	}
 	return &kubePods{opts: opts}, nil
 }
 
 // Create builds and creates a single bare worker pod. Tenant labels/annotations
 // are validated (system prefixes rejected) then merged so the system labels
 // always win.
+//
+// Annotation/label precedence is tenant first, cluster-wide second: where the
+// two name the same key, the operator's value stands. The cluster-wide set is a
+// platform policy — scrape targets, mesh injection, chargeback — declared once
+// for every worker pod in the cluster, and a policy a tenant can opt out of by
+// naming the same key in its own PodAnnotations/PodLabels is not a policy.
+// Tenants keep every key the operator has not claimed. The rest of
+// CommonPodOverrides (node selector, tolerations, affinity, DNS, priority) has
+// no tenant-level equivalent to merge with -- it is cluster-wide only, applied
+// as given.
 func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 	if err := validateNoSystemKeys(spec.Labels); err != nil {
 		return err
@@ -83,13 +103,27 @@ func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 	if err := validateNoSystemKeys(spec.Annotations); err != nil {
 		return err
 	}
+	// A tenant may not weaken its own pod's confinement. The pod/container
+	// securityContext (seccomp, dropped caps, read-only rootfs, non-root) is set
+	// as struct fields a tenant cannot reach, but the AppArmor/seccomp *beta/
+	// alpha annotations* predate those fields and are still honoured on many
+	// clusters, so a tenant annotation like
+	// container.apparmor.security.beta.kubernetes.io/<container>: unconfined
+	// would strip the profile. That stays within the tenant's own pod (no
+	// cross-tenant break), but ARCHITECTURE 6.1 says the system security context
+	// must not be overridable; this closes the annotation-shaped hole beside the
+	// struct fields. Operator CommonPodOverrides are trusted and not filtered.
+	if err := validateNoSecurityAnnotations(spec.Annotations); err != nil {
+		return err
+	}
+	ov := k.opts.CommonPodOverrides
 
-	labels := mergeMap(spec.Labels, map[string]string{
+	labels := mergeMap(mergeMap(spec.Labels, ov.Labels), map[string]string{
 		labelAppName:    appNameWorker,
 		labelTenantID:   spec.TenantID,
 		labelGeneration: k.opts.Generation,
 	})
-	annotations := mergeMap(spec.Annotations, nil)
+	annotations := mergeMap(spec.Annotations, ov.Annotations)
 
 	resources, err := k.resourceRequirements(spec)
 	if err != nil {
@@ -113,6 +147,14 @@ func (k *kubePods) Create(ctx context.Context, spec PodSpec) error {
 				RunAsNonRoot:   &trueVal,
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
+			NodeSelector:              ov.NodeSelector,
+			Tolerations:               ov.Tolerations,
+			Affinity:                  ov.Affinity,
+			TopologySpreadConstraints: ov.TopologySpreadConstraints,
+			DNSPolicy:                 ov.DNSPolicy,
+			DNSConfig:                 ov.DNSConfig,
+			PriorityClassName:         ov.PriorityClassName,
+			RuntimeClassName:          ov.RuntimeClassName,
 			Volumes: []corev1.Volume{{
 				Name:         bundlesVolumeName,
 				VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
@@ -166,6 +208,9 @@ func (k *kubePods) List(ctx context.Context) ([]ExistingPod, error) {
 			Name:     p.Name,
 			TenantID: p.Labels[labelTenantID],
 			Labels:   p.Labels,
+			// Worker pods run with RestartPolicyNever, so PodFailed is terminal:
+			// the container exited non-zero and Kubernetes will not retry it.
+			Failed: p.Status.Phase == corev1.PodFailed,
 		})
 	}
 	return out, nil
@@ -204,12 +249,44 @@ func (k *kubePods) resourceRequirements(spec PodSpec) (corev1.ResourceRequiremen
 }
 
 // validateNoSystemKeys rejects tenant metadata that collides with reserved
-// system prefixes.
+// system prefixes. Keys are lowercased before comparison, matching how
+// apimachinery treats key case and how validateMetadataMap validates, so the
+// two agree (Kubernetes would reject a mixed-case prefix anyway, but the check
+// should not depend on that).
 func validateNoSystemKeys(m map[string]string) error {
 	for k := range m {
+		lk := strings.ToLower(k)
 		for _, prefix := range systemLabelPrefixes {
-			if strings.HasPrefix(k, prefix) {
+			if strings.HasPrefix(lk, prefix) {
 				return fmt.Errorf("controller: metadata key %q uses reserved system prefix %q", k, prefix)
+			}
+		}
+	}
+	return nil
+}
+
+// securityAnnotationPrefixes name the container security profile through an
+// annotation rather than a securityContext field. A tenant setting any of them
+// on its own worker pod could relax the confinement the platform pins, so they
+// are rejected on tenant metadata (see Create). Lowercase; matched
+// case-insensitively.
+var securityAnnotationPrefixes = []string{
+	"container.apparmor.security.beta.kubernetes.io/",
+	"apparmor.security.beta.kubernetes.io/",
+	"seccomp.security.alpha.kubernetes.io/",
+	"container.seccomp.security.alpha.kubernetes.io/",
+}
+
+// validateNoSecurityAnnotations rejects tenant annotations that would override
+// the worker container's security profile (AppArmor/seccomp beta/alpha
+// annotations still honoured by many clusters).
+func validateNoSecurityAnnotations(m map[string]string) error {
+	for k := range m {
+		lk := strings.ToLower(k)
+		for _, prefix := range securityAnnotationPrefixes {
+			if strings.HasPrefix(lk, prefix) {
+				return fmt.Errorf("controller: annotation key %q sets a container security profile, "+
+					"which the platform pins and a tenant may not override", k)
 			}
 		}
 	}

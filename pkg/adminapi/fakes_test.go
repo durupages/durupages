@@ -24,6 +24,10 @@ type fakeProvider struct {
 	// Call records, for assertions.
 	created  []provider.Deployment
 	activate [][2]string // {pageID, deploymentID}
+
+	// listTenantsErr, when set, makes ListTenants fail with it. It is the
+	// simplest way to drive a non-ErrNotFound provider failure, i.e. a 500.
+	listTenantsErr error
 }
 
 var (
@@ -142,6 +146,9 @@ func (f *fakeProvider) UpsertTenant(ctx context.Context, t provider.Tenant) erro
 func (f *fakeProvider) ListTenants(ctx context.Context) ([]provider.Tenant, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.listTenantsErr != nil {
+		return nil, f.listTenantsErr
+	}
 	out := make([]provider.Tenant, 0, len(f.tenants))
 	for _, t := range f.tenants {
 		out = append(out, t)

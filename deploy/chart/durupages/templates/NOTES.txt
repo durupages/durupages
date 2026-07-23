@@ -9,10 +9,31 @@ Components:
 Worker pods are created at runtime by the controller in namespace "{{ .Values.workerNamespace }}"
 (ServiceAccount {{ .Values.workerServiceAccount }}, no token mounted). They are NOT part of this release.
 
-In-cluster addresses:
-  controller : {{ include "durupages.controllerAddr" . }}
-  hub bundle : {{ include "durupages.hubBundleAddr" . }}
-  hub log    : {{ include "durupages.hubLogAddr" . }} {{ if not .Values.logIngest.enabled }}(log ingest disabled -- pod-log mode){{ end }}
+Advertised addresses (what the router and worker pods dial):
+  controller : {{ include "durupages.controllerAddr" . }}{{ if .Values.controller.advertiseAddr }}  (controller.advertiseAddr){{ end }}
+  hub bundle : {{ include "durupages.hubBundleAddr" . }}{{ if .Values.hub.advertiseAddr }}  (hub.advertiseAddr){{ end }}
+  hub log    : {{ include "durupages.hubLogAddr" . }}{{ if .Values.hub.logAdvertiseAddr }}  (hub.logAdvertiseAddr){{ end }} {{ if not .Values.logIngest.enabled }}(log ingest disabled -- pod-log mode){{ end }}
+
+{{- if .Values.tls.enabled }}
+
+TLS: ENABLED. Certificates:
+  controller : secret {{ include "durupages.tls.controllerSecretName" . }}{{ if .Values.tls.controller.existingSecret }} (existing){{ else if .Values.tls.certManager.enabled }} (cert-manager){{ end }}
+  hub        : secret {{ include "durupages.tls.hubSecretName" . }}{{ if .Values.tls.hub.existingSecret }} (existing){{ else if .Values.tls.certManager.enabled }} (cert-manager){{ end }}
+  hub log    : {{ if include "durupages.tls.hubLogSeparate" . }}secret {{ include "durupages.tls.hubLogSecretName" . }}{{ if .Values.tls.hubLog.existingSecret }} (existing){{ else }} (cert-manager){{ end }}{{ else }}reuses the hub certificate{{ end }}
+{{- if .Values.controller.adminApi.enabled }}
+  admin API  : {{ if include "durupages.tls.adminSeparate" . }}secret {{ include "durupages.tls.adminSecretName" . }}{{ if .Values.tls.admin.existingSecret }} (existing){{ else }} (cert-manager){{ end }}{{ else }}reuses the controller certificate{{ end }}
+{{- end }}
+  CA         : {{ if include "durupages.tls.caEnabled" . }}secret {{ include "durupages.tls.caSecretName" . }} key {{ include "durupages.tls.caSecretKey" . }}{{ else }}system trust store (tls.caSecret.systemRoots){{ end }}
+{{- if .Values.tls.certManager.enabled }}
+
+  Watch issuance:
+    kubectl -n {{ .Release.Namespace }} get certificate
+{{- end }}
+{{- else }}
+
+TLS: disabled -- controller gRPC, hub bundle HTTP and hub log gRPC are plaintext.
+Turn it on with tls.enabled=true (see the chart README).
+{{- end }}
 
 {{- if .Values.workerJwt.existingSecret }}
 

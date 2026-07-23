@@ -17,9 +17,11 @@ package shim
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -28,6 +30,7 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/credentials/insecure"
 
 	"github.com/durupages/durupages/pkg/api"
@@ -73,7 +76,24 @@ type Options struct {
 	// When nil the shim runs in pod-log mode and writes JSON lines to LogWriter.
 	LogClient api.LogServiceClient
 	// LogWriter receives pod-log JSON lines (default os.Stdout).
+	//
+	// LogWriter is the *tenant-facing* log: one JSON usage event per request,
+	// including the worker's own console output. It is not the shim's own
+	// operational log — that is Logger below, and the two must not be mixed.
 	LogWriter io.Writer
+
+	// Logger receives the shim's own structured operational lines: the cause of
+	// every 4xx/5xx it returns (warn for 4xx, error for 5xx) and one info line
+	// per successful bundle load. It never carries worker output; that is
+	// LogWriter's job.
+	//
+	// When nil the slog.Default() logger is resolved at the time of logging, so
+	// a slog.SetDefault performed after New still takes effect. Defaulting to
+	// slog.Default() rather than to "logging disabled" is deliberate: an
+	// embedder that wires nothing at all still gets its 502 causes recorded,
+	// which is exactly the operational gap this package used to have. Tests
+	// that must stay quiet pass an explicit logger over io.Discard.
+	Logger *slog.Logger
 
 	// Now is the clock (default time.Now); tests inject a fake clock.
 	Now func() time.Time
@@ -90,6 +110,29 @@ type Options struct {
 	WorkerClient api.WorkerServiceClient
 	// HTTPClient is used for hub bundle downloads (default http.DefaultClient).
 	HTTPClient *http.Client
+
+	// ControllerTLS, when non-nil, secures the gRPC connection to
+	// ControllerAddr; nil dials plaintext. Transport security is opt-in, so an
+	// untouched deployment keeps working unchanged.
+	//
+	// These are *tls.Config rather than tlsconf.ClientOptions on purpose:
+	// turning environment variables into a verification policy is the command's
+	// job (see cmd/durupages-worker-shim), which keeps this library from reading
+	// the environment behind its embedder's back and lets a test hand in a
+	// config built any way it likes.
+	//
+	// Ignored when WorkerClient is injected: that client carries its own
+	// connection and its own credentials.
+	ControllerTLS *tls.Config
+
+	// HubTLS, when non-nil, secures bundle downloads; HubAddr must then be an
+	// https:// URL. It is attached to a clone of HTTPClient's transport, or to
+	// a transport built for the purpose when no HTTPClient is given.
+	//
+	// Passing an HTTPClient whose Transport is not an *http.Transport together
+	// with HubTLS is rejected by New rather than ignored: silently dropping the
+	// config would leave the shim trusting whatever that transport trusts.
+	HubTLS *tls.Config
 }
 
 // Shim is the worker-pod control loop. Construct it with New and drive it with
@@ -101,6 +144,10 @@ type Shim struct {
 	cacheMax   int64
 	sweepEvery time.Duration
 	httpClient *http.Client
+
+	// logger may be nil, meaning "resolve slog.Default() per log call" so that a
+	// later slog.SetDefault still takes effect (see (*Shim).log).
+	logger *slog.Logger
 
 	proxyLn, assetsLn, tailLn, healthLn net.Listener
 	assetsEndpoint, tailEndpoint        string
@@ -160,6 +207,7 @@ func New(opts Options) (*Shim, error) {
 		cacheMax:    opts.CacheMaxBytes,
 		sweepEvery:  opts.SweepInterval,
 		httpClient:  opts.HTTPClient,
+		logger:      opts.Logger,
 		deployments: map[string]*deployment{},
 		active:      map[string]string{},
 		loading:     map[string]*loadCall{},
@@ -177,8 +225,8 @@ func New(opts Options) (*Shim, error) {
 	if s.sweepEvery == 0 {
 		s.sweepEvery = envDuration("DURUPAGES_BUNDLE_SWEEP_INTERVAL", defaultSweepInterval)
 	}
-	if s.httpClient == nil {
-		s.httpClient = http.DefaultClient
+	if err := s.initHubClient(opts); err != nil {
+		return nil, err
 	}
 	s.cor = newCorrelator(s.now)
 	s.emitter = newEmitter(opts.LogClient, opts.LogWriter)
@@ -243,8 +291,10 @@ func (s *Shim) Run(ctx context.Context) error {
 		go func(srv *http.Server, ln net.Listener) {
 			defer wg.Done()
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-				// Serving errors are logged to the pod log; nothing to recover.
-				fmt.Fprintf(os.Stderr, "[shim] server error: %v\n", err)
+				// Serving errors are fatal for that listener; nothing to recover.
+				s.log().Error("shim: http server stopped",
+					slog.String("addr", ln.Addr().String()),
+					slog.String("error", err.Error()))
 			}
 		}(srv, sv.ln)
 	}
@@ -286,6 +336,44 @@ func (s *Shim) selfTerminate() {
 	}
 }
 
+// initHubClient resolves the HTTP client used for bundle downloads and applies
+// HubTLS to it.
+//
+// Neither the supplied client nor http.DefaultClient is mutated: both are
+// shared, and installing a TLS config into the default transport would change
+// certificate verification for every other user of it in the process. The
+// clone is cheap -- it happens once, at construction.
+func (s *Shim) initHubClient(opts Options) error {
+	if opts.HubTLS == nil {
+		if s.httpClient == nil {
+			s.httpClient = http.DefaultClient
+		}
+		return nil
+	}
+	if opts.HTTPClient == nil {
+		s.httpClient = &http.Client{Transport: &http.Transport{TLSClientConfig: opts.HubTLS}}
+		return nil
+	}
+
+	base, _ := http.DefaultTransport.(*http.Transport)
+	if opts.HTTPClient.Transport != nil {
+		t, ok := opts.HTTPClient.Transport.(*http.Transport)
+		if !ok {
+			return errors.New("shim: HubTLS needs an HTTPClient whose Transport is an *http.Transport (or no HTTPClient at all)")
+		}
+		base = t
+	}
+	if base == nil {
+		return errors.New("shim: HubTLS: no *http.Transport to attach it to")
+	}
+	tr := base.Clone()
+	tr.TLSClientConfig = opts.HubTLS
+	clone := *opts.HTTPClient
+	clone.Transport = tr
+	s.httpClient = &clone
+	return nil
+}
+
 // workerClient resolves the controller WorkerService client, dialing
 // ControllerAddr when no client was injected.
 func (s *Shim) workerClient() (api.WorkerServiceClient, func() error, error) {
@@ -295,7 +383,11 @@ func (s *Shim) workerClient() (api.WorkerServiceClient, func() error, error) {
 	if s.opts.ControllerAddr == "" {
 		return nil, nil, errors.New("shim: no controller client or address")
 	}
-	conn, err := grpc.NewClient(s.opts.ControllerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	creds := insecure.NewCredentials()
+	if s.opts.ControllerTLS != nil {
+		creds = credentials.NewTLS(s.opts.ControllerTLS)
+	}
+	conn, err := grpc.NewClient(s.opts.ControllerAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, nil, err
 	}

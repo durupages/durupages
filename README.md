@@ -51,6 +51,7 @@ Bring up the whole stack locally (k3s + PostgreSQL + MinIO + every component) an
 
 ```sh
 make e2e        # build images → start stack → verify scenarios → tear down
+make e2e-tls    # the same run with TLS between the components
 ```
 
 To bring up the stack and deploy something yourself:
@@ -155,7 +156,7 @@ helm install durupages deploy/chart/durupages \
   --set-file workerJwt.publicKeyPEM=worker-jwt.pub \
   --set postgres.dsn='postgres://...' \
   --set s3.bucket=durupages \
-  --set router.pagesDomain=pages.example.com
+  --set pagesDomain=pages.example.com
 ```
 
 The chart installs controller/router/hub plus the worker namespace, ServiceAccount, RBAC and NetworkPolicy. Worker Pods themselves are created by the controller at runtime. See [deploy/chart/durupages/README.md](deploy/chart/durupages/README.md) for the full values reference.
@@ -196,6 +197,7 @@ ctrl, err := controller.New(controller.Options{
 go build ./...
 go test -race ./...      # or: make test
 make e2e                 # integration e2e (requires Docker)
+make e2e-tls             # the same e2e with TLS between components
 ```
 
 Every binary prints its build-stamped version with `--version`. Release builds cross-compile `linux/amd64` and `linux/arm64` binaries with Go, and the images simply package those artifacts.

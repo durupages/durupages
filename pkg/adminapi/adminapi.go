@@ -45,15 +45,25 @@
 // config.secretKeys. Because a client therefore never holds the full map, the
 // /v1/pages/{pageId}/secrets sub-resource does per-key upsert and delete
 // server-side (read the page, change one key, write it back).
+//
+// # Observability
+//
+// Every request produces exactly one log/slog line on Options.Logger
+// (slog.Default() when unset), at info level for 2xx/3xx, warn for 4xx and
+// error for 5xx. A 5xx line also carries the server-side cause as "error", so
+// that a fault like an unwritable upload directory is diagnosable from the
+// controller's log alone and not only from the client's response. The URL
+// query is never logged.
 package adminapi
 
 import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/durupages/durupages/pkg/provider"
@@ -91,9 +101,33 @@ type Options struct {
 	// MaxExtractedBytes caps the total number of bytes written while
 	// extracting an uploaded archive. Defaults to four times MaxUploadBytes.
 	MaxExtractedBytes int64
-	// LogWriter, when non-nil, receives one JSON object per request
-	// (time, method, path, status, bytes, durationMs).
-	LogWriter io.Writer
+	// PagesDomain is the apex domain this controller serves pages on, e.g.
+	// "pages.example.com" for a page reachable at "{pageId}.pages.example.com".
+	// It is reported back on a deployment upload so that a client does not have
+	// to be configured with it separately (and cannot report a stale URL when
+	// the controller's domain changes). Optional: when empty the field is
+	// omitted from the response.
+	PagesDomain string
+	// TempDir is the parent directory for the temporary directory a deployment
+	// upload is extracted into. An empty value uses the os.TempDir() default.
+	//
+	// Deployments that run with a read-only root filesystem (for example a
+	// Kubernetes Pod with securityContext.readOnlyRootFilesystem: true) must
+	// point this at a writable volume, otherwise every upload fails with
+	// "create temp dir: ... read-only file system". New validates a non-empty
+	// value at startup so such a misconfiguration fails fast instead of on the
+	// first upload.
+	TempDir string
+	// Logger receives one structured line per request (method, path, status,
+	// bytes, durationMs, remoteAddr, plus error for 5xx). When nil the
+	// slog.Default() logger is used at the time of logging.
+	//
+	// Defaulting to slog.Default() rather than to "logging disabled" is
+	// deliberate: an embedder that wires nothing at all still gets its admin
+	// API traffic and its 5xx causes recorded, which is exactly the operational
+	// gap this package used to have. Tests that must stay quiet pass an
+	// explicit logger over io.Discard.
+	Logger *slog.Logger
 	// Now overrides the clock (for tests). Defaults to time.Now.
 	Now func() time.Time
 
@@ -135,10 +169,14 @@ type Server struct {
 
 	maxUpload    int64
 	maxExtracted int64
+	tempDir      string
+	pagesDomain  string
 	now          func() time.Time
 
-	logMu sync.Mutex
-	logw  io.Writer
+	// logger may be nil, meaning "resolve slog.Default() per request" so that a
+	// later slog.SetDefault still takes effect. slog loggers are safe for
+	// concurrent use, so no mutex is needed here.
+	logger *slog.Logger
 
 	mux *http.ServeMux
 	// handler is mux wrapped in Options.Middleware; ServeHTTP dispatches to it.
@@ -159,8 +197,10 @@ func New(opts Options) (*Server, error) {
 		storage:      opts.Storage,
 		maxUpload:    opts.MaxUploadBytes,
 		maxExtracted: opts.MaxExtractedBytes,
+		tempDir:      opts.TempDir,
+		pagesDomain:  strings.TrimSpace(opts.PagesDomain),
 		now:          opts.Now,
-		logw:         opts.LogWriter,
+		logger:       opts.Logger,
 	}
 	if s.maxUpload <= 0 {
 		s.maxUpload = DefaultMaxUploadBytes
@@ -170,6 +210,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if err := checkTempDir(s.tempDir); err != nil {
+		return nil, err
 	}
 
 	mux := http.NewServeMux()
@@ -215,6 +258,22 @@ func New(opts Options) (*Server, error) {
 	return s, nil
 }
 
+// checkTempDir verifies that a configured Options.TempDir is usable, so that a
+// read-only or missing directory is reported by New instead of turning the
+// first deployment upload into a 500. An empty dir means os.TempDir(), which is
+// left to the standard library.
+func checkTempDir(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	probe, err := os.MkdirTemp(dir, "probe-")
+	if err != nil {
+		return fmt.Errorf("adminapi: TempDir %q is not usable: %w", dir, err)
+	}
+	_ = os.Remove(probe)
+	return nil
+}
+
 // ServeHTTP runs the middleware chain and the router, then logs the outcome.
 // Logging is outermost so requests a middleware rejects are logged too.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -230,36 +289,54 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.WriteString(w, "ok")
 }
 
-// logEntry is one structured request log line.
-type logEntry struct {
-	Time       string `json:"time"`
-	Method     string `json:"method"`
-	Path       string `json:"path"`
-	Status     int    `json:"status"`
-	Bytes      int64  `json:"bytes"`
-	DurationMs int64  `json:"durationMs"`
+// logMessage labels every request log line, so a handler that mixes sources
+// can still filter this package's traffic.
+const logMessage = "admin api request"
+
+// log returns the logger to use: the configured one, or the process default
+// resolved late so that a slog.SetDefault after New is still honoured.
+func (s *Server) log() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
-// logRequest writes one JSON line to the configured writer; it is a no-op when
-// no writer was configured.
+// logRequest emits exactly one structured line per request.
+//
+// The level follows the outcome (2xx/3xx info, 4xx warn, 5xx error) so that an
+// operator can alert on server faults without drowning in normal traffic, and
+// the detail behind a 5xx (recorded by writeError) rides along as "error".
+//
+// The URL query is deliberately NOT logged. This API takes no secret in a
+// query parameter (secret values are body-only, and only deploymentId/activate
+// are read from the query), but Options.Middleware is an open extension point
+// where an operator may well accept a token as a query parameter, and a
+// request log is the last place such a token should surface.
 func (s *Server) logRequest(r *http.Request, rec *responseRecorder, d time.Duration) {
-	if s.logw == nil {
+	level := slog.LevelInfo
+	switch {
+	case rec.status >= http.StatusInternalServerError:
+		level = slog.LevelError
+	case rec.status >= http.StatusBadRequest:
+		level = slog.LevelWarn
+	}
+	logger := s.log()
+	if !logger.Enabled(r.Context(), level) {
 		return
 	}
-	b, err := json.Marshal(logEntry{
-		Time:       s.now().UTC().Format(time.RFC3339Nano),
-		Method:     r.Method,
-		Path:       r.URL.Path,
-		Status:     rec.status,
-		Bytes:      rec.bytes,
-		DurationMs: d.Milliseconds(),
-	})
-	if err != nil {
-		return
+	attrs := []slog.Attr{
+		slog.String("method", r.Method),
+		slog.String("path", r.URL.Path),
+		slog.Int("status", rec.status),
+		slog.Int64("bytes", rec.bytes),
+		slog.Int64("durationMs", d.Milliseconds()),
+		slog.String("remoteAddr", r.RemoteAddr),
 	}
-	s.logMu.Lock()
-	defer s.logMu.Unlock()
-	_, _ = s.logw.Write(append(b, '\n'))
+	if rec.serverErr != "" {
+		attrs = append(attrs, slog.String("error", rec.serverErr))
+	}
+	logger.LogAttrs(r.Context(), level, logMessage, attrs...)
 }
 
 // responseRecorder captures the response status and size for logging, and
@@ -271,6 +348,17 @@ type responseRecorder struct {
 	bytes   int64
 	wrote   bool
 	swallow bool
+	// serverErr is the detail behind a 5xx reply, kept for the request log.
+	serverErr string
+}
+
+// recordServerError stores the cause of a server-side failure so ServeHTTP can
+// log it. The first one wins: it is the failure that produced the response,
+// while anything after it is a follow-up on an already-committed reply.
+func (w *responseRecorder) recordServerError(msg string) {
+	if w.serverErr == "" {
+		w.serverErr = msg
+	}
 }
 
 func (w *responseRecorder) WriteHeader(code int) {

@@ -1,6 +1,9 @@
 # Copyright 2026 JC-Lab
 # SPDX-License-Identifier: EPL-2.0
 
+{{/* Rendered unconditionally, so a broken TLS configuration fails at template
+     time rather than as a CrashLoopBackOff. */}}
+{{- include "durupages.tls.validate" . }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -17,20 +20,31 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "durupages.componentLabels" (dict "root" . "component" "controller") | nindent 4 }}
+    {{- with .Values.controller.service.labels }}{{ toYaml . | nindent 4 }}{{- end }}
+  {{- with .Values.controller.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
-  type: ClusterIP
+  {{- include "durupages.service.spec" (dict "service" .Values.controller.service) | nindent 2 }}
   ports:
     - name: grpc
       port: {{ .Values.controller.service.port }}
       targetPort: grpc
       protocol: TCP
+      {{- with .Values.controller.service.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
     {{- if .Values.controller.adminApi.enabled }}
-    # Admin API — UNAUTHENTICATED by design. It is exposed only as a ClusterIP
-    # port; do not add an Ingress/LoadBalancer for it without your own auth.
+    # Admin API — UNAUTHENTICATED by design. Exposing it beyond the cluster is
+    # your own risk; do not add an Ingress/LoadBalancer without your own auth.
     - name: admin
       port: {{ .Values.controller.adminApi.service.port }}
       targetPort: admin
       protocol: TCP
+      {{- with .Values.controller.adminApi.service.nodePort }}
+      nodePort: {{ . }}
+      {{- end }}
     {{- end }}
   selector:
     {{- include "durupages.componentSelectorLabels" (dict "root" . "component" "controller") | nindent 4 }}
@@ -56,6 +70,12 @@ spec:
         {{- with .Values.controller.podLabels }}{{ toYaml . | nindent 8 }}{{- end }}
       annotations:
         checksum/worker-jwt: {{ include "durupages.workerJwtSecretName" . | sha256sum }}
+        {{- if .Values.worker.podOverrides }}
+        # Content, not name: the ConfigMap's name never changes, so hashing it
+        # would never roll the controller and an edited override set would sit
+        # unread until something else restarted the pod.
+        checksum/worker-pod-overrides: {{ include "durupages.workerPodOverridesYAML" . | sha256sum }}
+        {{- end }}
         {{- with .Values.controller.podAnnotations }}{{ toYaml . | nindent 8 }}{{- end }}
     spec:
       serviceAccountName: {{ include "durupages.controllerServiceAccountName" . }}
@@ -65,7 +85,7 @@ spec:
       {{- end }}
       containers:
         - name: controller
-          image: "{{ .Values.controller.image.repository }}:{{ .Values.controller.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "durupages.image" (dict "root" . "image" .Values.controller.image) | quote }}
           imagePullPolicy: {{ .Values.controller.image.pullPolicy }}
           args:
             - --worker-jwt-signing-key=/etc/durupages/worker-jwt/{{ .Values.workerJwt.privateKeyKey }}
@@ -76,25 +96,61 @@ spec:
             - --max-concurrency-per-pod={{ .Values.controller.maxConcurrencyPerPod }}
             - --target-concurrency-per-pod={{ .Values.controller.targetConcurrencyPerPod }}
             - --default-idle-ttl={{ .Values.controller.defaultIdleTTL }}
+            {{- if .Values.worker.podOverrides }}
+            - --worker-pod-overrides-file={{ include "durupages.workerPodOverridesFile" . }}
+            {{- end }}
+            {{- with .Values.controller.extraArgs }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           env:
             - name: DURUPAGES_LISTEN
               value: ":{{ .Values.controller.service.port }}"
             - name: DURUPAGES_PAGES_DOMAIN
-              value: {{ .Values.controller.pagesDomain | quote }}
+              value: {{ .Values.pagesDomain | quote }}
             - name: DURUPAGES_MIGRATE
               value: {{ .Values.controller.migrate | quote }}
+            # The *_ADVERTISE_* addresses are what the controller hands to the
+            # worker pods it creates; they are not addresses it dials itself.
             - name: DURUPAGES_CONTROLLER_ADVERTISE_ADDR
               value: {{ include "durupages.controllerAddr" . | quote }}
-            - name: DURUPAGES_HUB_ADDR
+            - name: DURUPAGES_HUB_ADVERTISE_ADDR
               value: {{ include "durupages.hubBundleAddr" . | quote }}
             {{- if .Values.logIngest.enabled }}
-            - name: DURUPAGES_HUB_LOG_ADDR
+            - name: DURUPAGES_HUB_LOG_ADVERTISE_ADDR
               value: {{ include "durupages.hubLogAddr" . | quote }}
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            # Own gRPC listener certificate. tlsconf reloads it from disk, so a
+            # cert-manager renewal takes effect without a restart.
+            - name: DURUPAGES_TLS_CERT_FILE
+              value: {{ printf "%s/tls.crt" (include "durupages.tls.certDir" .) | quote }}
+            - name: DURUPAGES_TLS_KEY_FILE
+              value: {{ printf "%s/tls.key" (include "durupages.tls.certDir" .) | quote }}
+            {{- if and .Values.controller.adminApi.enabled (include "durupages.tls.adminSeparate" .) }}
+            # Admin API on its own certificate/domain (it reuses the one above
+            # when these are unset).
+            - name: DURUPAGES_ADMIN_TLS_CERT_FILE
+              value: {{ printf "%s/tls.crt" (include "durupages.tls.adminCertDir" .) | quote }}
+            - name: DURUPAGES_ADMIN_TLS_KEY_FILE
+              value: {{ printf "%s/tls.key" (include "durupages.tls.adminCertDir" .) | quote }}
+            {{- end }}
+            {{- if include "durupages.tls.caEnabled" . }}
+            # Injected into every worker pod as inline DURUPAGES_CA_CERT_PEM:
+            # worker pods live in another namespace and are created at runtime,
+            # so the bundle travels in the pod spec instead of as a Secret.
+            - name: DURUPAGES_WORKER_CA_CERT_FILE
+              value: {{ include "durupages.tls.caFile" . | quote }}
+            {{- end }}
+            {{- end }}
+            {{- with (include "durupages.tls.clientEnv" .) }}
+            # Restated to every worker pod: whether each endpoint speaks TLS is
+            # knowledge the controller has and the worker cannot infer.
+            {{- . | nindent 12 }}
             {{- end }}
             - name: DURUPAGES_WORKER_NAMESPACE
               value: {{ .Values.workerNamespace | quote }}
             - name: DURUPAGES_WORKER_IMAGE
-              value: "{{ .Values.worker.image.repository }}:{{ .Values.worker.image.tag | default .Chart.AppVersion }}"
+              value: {{ include "durupages.image" (dict "root" . "image" .Values.worker.image) | quote }}
             - name: DURUPAGES_WORKER_SA
               value: {{ .Values.workerServiceAccount | quote }}
             - name: DURUPAGES_WORKER_CPU_LIMIT
@@ -127,6 +183,9 @@ spec:
             {{- end }}
             {{- include "durupages.s3Env" . | nindent 12 }}
             {{- end }}
+            {{- with .Values.controller.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           ports:
             - name: grpc
               containerPort: {{ .Values.controller.service.port }}
@@ -148,6 +207,28 @@ spec:
             - name: worker-jwt
               mountPath: /etc/durupages/worker-jwt
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.worker.podOverrides }}
+            - name: worker-pod-overrides
+              mountPath: {{ include "durupages.workerPodOverridesDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.tls.enabled }}
+            - name: tls
+              mountPath: {{ include "durupages.tls.certDir" . }}
+              readOnly: true
+            {{- if and .Values.controller.adminApi.enabled (include "durupages.tls.adminSeparate" .) }}
+            - name: tls-admin
+              mountPath: {{ include "durupages.tls.adminCertDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if include "durupages.tls.caEnabled" . }}
+            - name: ca
+              mountPath: {{ include "durupages.tls.caDir" . }}
+              readOnly: true
+            {{- end }}
+            {{- end }}
       volumes:
         - name: worker-jwt
           secret:
@@ -155,6 +236,34 @@ spec:
             items:
               - key: {{ .Values.workerJwt.privateKeyKey }}
                 path: {{ .Values.workerJwt.privateKeyKey }}
+        {{- if .Values.worker.podOverrides }}
+        - name: worker-pod-overrides
+          configMap:
+            name: {{ include "durupages.workerPodOverridesName" . }}
+        {{- end }}
+        {{- if .Values.tls.enabled }}
+        {{- include "durupages.tls.certVolume" (dict
+              "name" "tls"
+              "secretName" (include "durupages.tls.controllerSecretName" .)
+              "certKey" .Values.tls.controller.certKey
+              "keyKey" .Values.tls.controller.keyKey) | nindent 8 }}
+        {{- if and .Values.controller.adminApi.enabled (include "durupages.tls.adminSeparate" .) }}
+        {{- include "durupages.tls.certVolume" (dict
+              "name" "tls-admin"
+              "secretName" (include "durupages.tls.adminSecretName" .)
+              "certKey" .Values.tls.admin.certKey
+              "keyKey" .Values.tls.admin.keyKey) | nindent 8 }}
+        {{- end }}
+        {{- if include "durupages.tls.caEnabled" . }}
+        {{- include "durupages.tls.caVolume" . | nindent 8 }}
+        {{- end }}
+        {{- end }}
+        # securityContext.readOnlyRootFilesystem makes / read-only, so /tmp must
+        # be a writable volume. The admin API stages each uploaded deployment
+        # here while extracting it (see controller.tmpSize).
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.controller.tmpSize }}
       {{- with .Values.controller.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

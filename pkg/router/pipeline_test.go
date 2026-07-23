@@ -5,6 +5,8 @@ package router
 
 import (
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -371,6 +373,9 @@ func TestLogServiceMode(t *testing.T) {
 		Storage:   mem,
 		Cache:     cache,
 		LogClient: api.NewLogServiceClient(conn),
+		// This test is about the usage log; keep the operational log quiet
+		// instead of letting it fall through to slog.Default().
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	if err != nil {
 		t.Fatal(err)

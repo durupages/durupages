@@ -11,6 +11,11 @@ name: Build durupages-workerd
 # The image is tagged  v${WORKERD_UPSTREAM_VERSION}-duru${revision}
 # where WORKERD_UPSTREAM_VERSION comes from native/durupages-workerd/WORKERD_VERSION
 # and ${revision} is the manual input. Example: v1.20260721.1-duru1.
+#
+# A successful push is also recorded as a git tag  worker-<version>
+# (e.g. worker-v1.20260721.1-duru1), so the commit an image was built from is
+# recoverable later. The worker- prefix keeps it clear of the release
+# workflow's tag glob, which only matches bare vMAJOR.MINOR.PATCH tags.
 
 on:
   workflow_dispatch:
@@ -150,6 +155,26 @@ jobs:
           ./native/durupages-workerd/build.sh
           ./native/durupages-workerd/bin/durupages-workerd --version
 
+      - name: Verify the binary runs on the runtime base image
+        # The binary is compiled on the runner, not in a container, so its glibc
+        # floor is the RUNNER's. Running it here only proves it works on the
+        # runner. It shipped once linked against GLIBC_2.38 into a bookworm
+        # (2.36) image and died at startup, turning every request into a 502
+        # that named no cause. Run it against the actual runtime base so an ABI
+        # mismatch fails the build instead of production. The base is read out
+        # of the Dockerfile so the two cannot drift apart.
+        run: |
+          set -euo pipefail
+          base="$(awk '/AS worker-native/ {print $2}' Dockerfile)"
+          if [ -z "$base" ]; then
+            echo "::error::could not find the worker-native base image in Dockerfile"
+            exit 1
+          fi
+          echo "runtime base: $base"
+          docker run --rm --entrypoint /bin/sh \
+            -v "$PWD/native/durupages-workerd/bin:/durupages:ro" "$base" \
+            -c '/durupages/durupages-workerd --version'
+
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
         with:
@@ -238,23 +263,62 @@ jobs:
       - name: Inspect image
         run: docker buildx imagetools inspect "${REGISTRY_IMAGE}:${{ needs.version.outputs.version }}"
 
+  # Tagging rides along here instead of in a job of its own: a separate job pays
+  # a runner spin-up for what is a handful of git commands, and this job already
+  # waits on exactly the same things.
   summary:
     name: summary
     needs: [version, build, merge]
     if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@v7
+
+      # Record which commit the published image was built from. This job runs
+      # even when merge did not (that is what makes it a summary), so the tag is
+      # gated on the publish having actually succeeded: a push_image=false run
+      # is a build check, and a failed merge published nothing. Neither may
+      # leave a release marker behind.
+      - name: Create and push tag
+        id: tag
+        if: ${{ inputs.push_image && needs.merge.result == 'success' }}
+        env:
+          TAG: worker-${{ needs.version.outputs.version }}
+          WORKERD_REF: ${{ needs.version.outputs.workerd_ref }}
+        run: |
+          set -euo pipefail
+          # A revision is meant to be used once. If the tag is already taken the
+          # merge job has just overwritten someone else's image tag, so say so
+          # rather than moving the tag and hiding it.
+          if git ls-remote --exit-code --tags origin "refs/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::tag ${TAG} already exists; bump the revision input instead of reusing it"
+            exit 1
+          fi
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              tag -a "${TAG}" -m "durupages-workerd ${TAG#worker-} (workerd ref ${WORKERD_REF})"
+          git push origin "refs/tags/${TAG}"
+          echo "tagged ${GITHUB_SHA} as ${TAG}"
+
       - name: Summary
+        if: ${{ !cancelled() }}
         run: |
           {
             echo "## durupages-workerd ${{ needs.version.outputs.version }}"
             echo ""
             echo "- workerd ref: \`${{ needs.version.outputs.workerd_ref }}\`"
             echo "- binary artifacts: durupages-workerd-${{ needs.version.outputs.version }}-amd64, -arm64"
-            if [ "${{ inputs.push_image }}" = "true" ]; then
-              echo "- image: \`ghcr.io/${{ github.repository_owner }}/durupages-worker:${{ needs.version.outputs.version }}\` (linux/amd64, linux/arm64)"
-            else
+            if [ "${{ inputs.push_image }}" != "true" ]; then
               echo "- image: not pushed (push_image=false)"
+              echo "- git tag: not created (push_image=false)"
+            elif [ "${{ needs.merge.result }}" != "success" ]; then
+              echo "- image: publish failed (merge: ${{ needs.merge.result }})"
+              echo "- git tag: not created"
+            else
+              echo "- image: \`ghcr.io/${{ github.repository_owner }}/durupages-worker:${{ needs.version.outputs.version }}\` (linux/amd64, linux/arm64)"
+              echo "- git tag: \`worker-${{ needs.version.outputs.version }}\` on \`${GITHUB_SHA}\`"
             fi
           } >> "$GITHUB_STEP_SUMMARY"

@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"errors"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -76,12 +77,33 @@ type Options struct {
 	// Now returns the current time; defaults to time.Now. Injectable for tests.
 	Now func() time.Time
 
-	// ControllerAddr / HubAddr are propagated to worker pods via env.
+	// ControllerAddr / HubAddr are the addresses workers are told to use, not
+	// the ones this process listens on; they are propagated to worker pods via
+	// env.
 	ControllerAddr string
 	HubAddr        string
 	// HubLogAddr, when set, enables worker log ingest by propagating
 	// DURUPAGES_HUB_LOG_ADDR; empty keeps workers in pod-log mode.
 	HubLogAddr string
+
+	// WorkerCACertFile is the PEM CA bundle workers verify TLS servers against.
+	// Its contents are re-read per pod creation and injected as inline
+	// DURUPAGES_CA_CERT_PEM (see workertls.go). Empty means workers are told
+	// nothing about a CA, which leaves them on the system roots.
+	WorkerCACertFile string
+	// ControllerTLS / HubLogTLS state whether those endpoints serve TLS. The
+	// worker cannot tell from the address alone, so the controller passes on
+	// what it knows. The hub bundle endpoint needs no such flag: its scheme in
+	// HubAddr already says it.
+	ControllerTLS bool
+	HubLogTLS     bool
+	// ControllerServerName / HubServerName / HubLogServerName override the name
+	// verified in each server's certificate. Set one when the advertised
+	// address does not match a SAN -- a Service reached by cluster IP, say.
+	// Empty leaves the worker to derive the name from the address.
+	ControllerServerName string
+	HubServerName        string
+	HubLogServerName     string
 
 	// BundleMinIdle / BundleCacheMaxBytes / BundleSweepInterval, when set, are
 	// propagated to worker pods as the DURUPAGES_BUNDLE_* tuning envs.
@@ -94,6 +116,19 @@ type Options struct {
 	// HeartbeatInterval is advertised to shims and drives the reconcile adoption
 	// window (2x this value). Default 10s.
 	HeartbeatInterval time.Duration
+	// PodRegistrationTimeout bounds how long a freshly-created worker pod may
+	// take to register before the controller gives up on it, deletes it and
+	// frees the slot it was holding. Without it a pod that never becomes Ready
+	// -- an unschedulable pod (a nodeSelector/affinity/taint the cluster cannot
+	// satisfy) or one stuck on an image pull -- would sit in phaseCreating
+	// forever, counted toward the tenant's pod ceiling, so no replacement is
+	// ever created and every request for that tenant queues and times out. Such
+	// a pod never reaches Kubernetes' terminal PodFailed phase (it stays
+	// Pending), so the failed-pod reclaim cannot catch it; this timeout does.
+	//
+	// It must comfortably exceed a realistic cold image pull, since a pod
+	// deleted mid-pull would only be recreated to pull again. Default 5m.
+	PodRegistrationTimeout time.Duration
 	// WorkerJWTTTL is the lifetime of issued worker JWTs (default 1h).
 	WorkerJWTTTL time.Duration
 	// LeaseGrace is the slack added past a lease deadline before the watchdog
@@ -114,6 +149,11 @@ type Controller struct {
 	// creates them; Run cancels on return.
 	ctx    context.Context
 	cancel context.CancelFunc
+
+	// workerCA holds the CA bundle handed to worker pods, nil when none is
+	// configured. It re-reads the file so pods created after a CA rotation get
+	// the new bundle.
+	workerCA *caFileCache
 
 	mu      sync.Mutex
 	tenants map[string]*tenant
@@ -172,6 +212,7 @@ func New(opts Options) (*Controller, error) {
 
 	setDurDefault(&opts.ScaleDownInterval, 30*time.Second)
 	setDurDefault(&opts.HeartbeatInterval, 10*time.Second)
+	setDurDefault(&opts.PodRegistrationTimeout, 5*time.Minute)
 	setDurDefault(&opts.WorkerJWTTTL, time.Hour)
 	setDurDefault(&opts.LeaseGrace, 10*time.Second)
 	setDurDefault(&opts.DrainGrace, d.RequestTimeout)
@@ -181,16 +222,43 @@ func New(opts Options) (*Controller, error) {
 		return nil, errors.New("controller: signing key has no ed25519 public half")
 	}
 
+	// Load the worker CA up front: a path that cannot be read is an operator
+	// mistake, and failing here beats starting a controller whose every
+	// scale-up quietly fails.
+	var workerCA *caFileCache
+	if opts.WorkerCACertFile != "" {
+		var err error
+		if workerCA, err = newCAFileCache(opts.WorkerCACertFile); err != nil {
+			return nil, err
+		}
+	}
+
+	// Advertising TLS to workers without giving them a CA leaves them verifying
+	// against the system roots, which fails as "unknown authority" on a worker's
+	// first dial rather than at startup. That is correct only when the servers
+	// present publicly-trusted certificates (an ACME/public CA); with an
+	// internal CA it is a forgotten --worker-ca-cert-file. It is not an error --
+	// the system-roots case is legitimate -- but it is worth saying out loud at
+	// startup rather than leaving it to surface later as a dial failure. This is
+	// only observability; TLS itself never silently downgrades to plaintext.
+	if (opts.ControllerTLS || opts.HubLogTLS) && opts.WorkerCACertFile == "" {
+		slog.Warn("controller: advertising TLS to workers with no worker CA configured; "+
+			"workers will verify against the system trust store -- correct for publicly-trusted "+
+			"server certificates, but a missing --worker-ca-cert-file when the servers use an internal CA",
+			"controllerTLS", opts.ControllerTLS, "hubLogTLS", opts.HubLogTLS)
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	c := &Controller{
-		opts:    opts,
-		pub:     pub,
-		now:     opts.Now,
-		ctx:     ctx,
-		cancel:  cancel,
-		tenants: make(map[string]*tenant),
-		leases:  make(map[string]*leaseRec),
-		waiters: make(map[string]*waiter),
+		opts:     opts,
+		pub:      pub,
+		now:      opts.Now,
+		workerCA: workerCA,
+		ctx:      ctx,
+		cancel:   cancel,
+		tenants:  make(map[string]*tenant),
+		leases:   make(map[string]*leaseRec),
+		waiters:  make(map[string]*waiter),
 	}
 	return c, nil
 }
